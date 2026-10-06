@@ -1,0 +1,46 @@
+import { useEffect, useState } from 'react'
+import { useParams, Link } from 'react-router-dom'
+import { api, money, initials } from '../api.js'
+import { Empty, Money } from '../components.jsx'
+
+export default function BusinessDetail({ user }) {
+  const { id } = useParams()
+  const [b, setB] = useState(null)
+  const c = user.currency
+  useEffect(() => { api(`/businesses/${id}`).then(setB) }, [id])
+  if (!b) return <p className="sub">Loading business…</p>
+  return (
+    <>
+      <Link to="/businesses" className="sub">Back to businesses</Link>
+      <div className="row" style={{ marginTop: 8 }}>
+        <div className="avatar" style={{ background: b.brand_color, width: 56, height: 56 }}>{b.logo ? <img src={b.logo} alt="" /> : initials(b.name)}</div>
+        <div>
+          <h2>{b.name}</h2>
+          <p className="sub">{b.type} · {b.status} · {b.description || 'No description'}</p>
+        </div>
+      </div>
+      <div className="grid kpis">
+        <div className="card kpi"><div className="label">Revenue</div><div className="value pos">{money(b.businessRevenue, c)}</div></div>
+        <div className="card kpi"><div className="label">Expenses</div><div className="value neg">{money(b.businessExpenses, c)}</div></div>
+        <div className="card kpi"><div className="label">Profit</div><div className="value"><Money value={b.businessProfit} currency={c} signed /></div></div>
+        <div className="card kpi"><div className="label">Cash</div><div className="value">{money(b.cash, c)}</div></div>
+        <div className="card kpi"><div className="label">Owner draws</div><div className="value">{money(b.ownerDraws, c)}</div></div>
+        <div className="card kpi"><div className="label">Owner contributions</div><div className="value">{money(b.ownerContributions, c)}</div></div>
+      </div>
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Accounts</h3>
+        {b.accounts?.length ? b.accounts.map(a => (
+          <div key={a.id} className="row" style={{ justifyContent: 'space-between' }}><span>{a.name}</span><span>{money(a.balance, c)}</span></div>
+        )) : <Empty title="No accounts linked to this business yet." />}
+      </div>
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Transactions</h3>
+        {b.transactions?.length ? b.transactions.map(t => (
+          <div key={t.id} className="row" style={{ justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--line)' }}>
+            <span>{t.date} · {t.type} · {t.description}</span><span>{money(t.amount, c)}</span>
+          </div>
+        )) : <Empty title="No business transactions yet." />}
+      </div>
+    </>
+  )
+}
