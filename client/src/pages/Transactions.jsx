@@ -10,8 +10,8 @@ export default function Transactions({ user }) {
   const [creating, setCreating] = useState(false)
   const lookups = useLookups()
   const c = user.currency
-  const accName = id => lookups.accounts.find(a => a.id === id)?.name || '—'
-  const catName = id => lookups.categories.find(x => x.id === id)?.name || '—'
+  const accName = id => lookups.accounts.find(a => Number(a.id) === Number(id))?.name || '—'
+  const catName = id => lookups.categories.find(x => Number(x.id) === Number(id))?.name || '—'
 
   async function load() {
     const p = new URLSearchParams()

@@ -8,11 +8,12 @@ import bcrypt from 'bcryptjs'
 import { db, uploadsDir } from './db.js'
 import { authMiddleware, publicUser, register, login, signToken, createResetToken, resetPassword } from './auth.js'
 import {
-  accountBalance, allAccountBalances, syncDebtBalance, goalProgress, netWorth, recordSnapshot,
+  accountBalance, allAccountBalances, syncDebtBalance, syncAllDebts, debtBalance, netWorth, recordSnapshot,
   periodRange, periodStats, cashFlowSeries, expenseDistribution, financialHealthScore,
   budgetPerformance, nextAction, coachInsights, affordability, applyAllocation, businessSummary,
-  round2, txFilter
+  round2, txFilter, ACCOUNT_TYPES, TX_TYPES
 } from './finance.js'
+import { parseMoney, asId, sameId, isoDate, isIsoDate, fromCents, toCents } from './money.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.PORT || 5173)
@@ -33,19 +34,55 @@ const imageFilter = (_req, file, cb) => {
 const uploadLogo = multer({ storage: logoStorage, fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } })
 const uploadAttach = multer({ storage: attachStorage, fileFilter: imageFilter, limits: { fileSize: 8 * 1024 * 1024 } })
 
+const OWN_TABLES = new Set([
+  'accounts', 'businesses', 'categories', 'transactions', 'budgets', 'debts',
+  'goals', 'recurring_transactions', 'allocation_rules', 'attachments', 'notifications'
+])
+
 function own(table, userId, id) {
-  return db.prepare(`SELECT * FROM ${table} WHERE id = ? AND user_id = ?`).get(id, userId)
+  if (!OWN_TABLES.has(table)) return null
+  const nid = asId(id)
+  if (!nid) return null
+  return db.prepare(`SELECT * FROM ${table} WHERE id = ? AND user_id = ?`).get(nid, userId)
 }
 
 function parseTags(tags) {
   if (Array.isArray(tags)) return tags.join(',')
-  return tags || ''
+  return String(tags || '').slice(0, 200)
+}
+
+function emptyToNull(v) {
+  if (v == null || v === '' || v === 'undefined' || v === 'null') return null
+  return v
+}
+
+function refreshNotifications(userId) {
+  syncAllDebts(userId)
+  const today = isoDate()
+  const insert = db.prepare('INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)')
+  const exists = db.prepare('SELECT id FROM notifications WHERE user_id=? AND title=? AND substr(created_at,1,10)=?')
+  const debts = db.prepare("SELECT * FROM debts WHERE user_id=? AND status IN ('active','overdue')").all(userId)
+  for (const d of debts) {
+    if (d.status === 'overdue') {
+      const title = `Overdue: ${d.creditor}`
+      if (!exists.get(userId, title, today)) insert.run(userId, 'critical', title, `${d.creditor} is overdue. Remaining ${fromCents(toCents(d.current_balance))}.`)
+    } else if (d.due_date && d.due_date <= today) {
+      const title = `Due today: ${d.creditor}`
+      if (!exists.get(userId, title, today)) insert.run(userId, 'warning', title, `${d.creditor} is due ${d.due_date}.`)
+    }
+  }
+  const budgets = budgetPerformance(userId, periodRange('month'))
+  for (const b of budgets) {
+    if (b.status === 'exceeded') {
+      const title = `Budget exceeded: ${b.name}`
+      if (!exists.get(userId, title, today)) insert.run(userId, 'warning', title, `${b.name} is over budget this period.`)
+    }
+  }
 }
 
 async function start() {
-  const app = express()
-  app.use(express.json({ limit: '2mb' }))
-  app.use('/uploads', express.static(uploadsDir))
+    const app = express()
+    app.use(express.json({ limit: '2mb' }))
 
   const api = express.Router()
 
@@ -118,30 +155,43 @@ async function start() {
   })
 
   api.get('/accounts', (req, res) => {
-    const rows = allAccountBalances(req.user.id)
-    res.json(rows)
+    const includeArchived = req.query.includeArchived === '1'
+    res.json(allAccountBalances(req.user.id, { includeArchived }))
   })
 
   api.post('/accounts', (req, res) => {
-    const { name, type, provider, currency, initialBalance, icon, color, notes, status, businessId } = req.body
-    if (!name || !type) return res.status(400).json({ error: 'Name and type are required' })
-    const info = db.prepare(`INSERT INTO accounts (user_id, name, type, provider, currency, initial_balance, icon, color, notes, status, business_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, name, type, provider || '', currency || req.user.currency, Number(initialBalance) || 0, icon || 'wallet', color || '#2E90FA', notes || '', status || 'active', businessId || null)
-    recordSnapshot(req.user.id)
-    const a = own('accounts', req.user.id, info.lastInsertRowid)
-    res.json({ ...a, balance: accountBalance(req.user.id, a.id) })
+    try {
+      const { name, type, provider, currency, initialBalance, icon, color, notes, status, businessId } = req.body
+      if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and type are required' })
+      if (!ACCOUNT_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid account type' })
+      const biz = emptyToNull(businessId)
+      if (biz && !own('businesses', req.user.id, biz)) return res.status(400).json({ error: 'Business not found' })
+      const initial = parseMoney(initialBalance ?? 0, { allowZero: true, allowNegative: type === 'credit_card', field: 'Initial balance' })
+      const info = db.prepare(`INSERT INTO accounts (user_id, name, type, provider, currency, initial_balance, icon, color, notes, status, business_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), type, provider || '', currency || req.user.currency, initial, icon || 'wallet', color || '#2E90FA', notes || '', status === 'archived' ? 'archived' : 'active', asId(biz))
+      recordSnapshot(req.user.id)
+      const a = own('accounts', req.user.id, info.lastInsertRowid)
+      res.json({ ...a, balance: accountBalance(req.user.id, a.id) })
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.put('/accounts/:id', (req, res) => {
-    const a = own('accounts', req.user.id, req.params.id)
-    if (!a) return res.status(404).json({ error: 'Account not found' })
-    const b = req.body
-    db.prepare(`UPDATE accounts SET name=?, type=?, provider=?, currency=?, initial_balance=?, icon=?, color=?, notes=?, status=?, business_id=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
-      .run(b.name ?? a.name, b.type ?? a.type, b.provider ?? a.provider, b.currency ?? a.currency, b.initialBalance ?? a.initial_balance, b.icon ?? a.icon, b.color ?? a.color, b.notes ?? a.notes, b.status ?? a.status, b.businessId === undefined ? a.business_id : b.businessId, a.id, req.user.id)
-    recordSnapshot(req.user.id)
-    const u = own('accounts', req.user.id, a.id)
-    res.json({ ...u, balance: accountBalance(req.user.id, u.id) })
+    try {
+      const a = own('accounts', req.user.id, req.params.id)
+      if (!a) return res.status(404).json({ error: 'Account not found' })
+      const b = req.body
+      const type = b.type ?? a.type
+      if (!ACCOUNT_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid account type' })
+      const biz = b.businessId === undefined ? a.business_id : emptyToNull(b.businessId)
+      if (biz && !own('businesses', req.user.id, biz)) return res.status(400).json({ error: 'Business not found' })
+      const initial = b.initialBalance === undefined ? a.initial_balance : parseMoney(b.initialBalance, { allowZero: true, allowNegative: type === 'credit_card', field: 'Initial balance' })
+      db.prepare(`UPDATE accounts SET name=?, type=?, provider=?, currency=?, initial_balance=?, icon=?, color=?, notes=?, status=?, business_id=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
+        .run(b.name ?? a.name, type, b.provider ?? a.provider, b.currency ?? a.currency, initial, b.icon ?? a.icon, b.color ?? a.color, b.notes ?? a.notes, b.status ?? a.status, asId(biz), a.id, req.user.id)
+      recordSnapshot(req.user.id)
+      const u = own('accounts', req.user.id, a.id)
+      res.json({ ...u, balance: accountBalance(req.user.id, u.id) })
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.post('/accounts/:id/archive', (req, res) => {
@@ -171,7 +221,7 @@ async function start() {
   api.post('/businesses', uploadLogo.single('logo'), (req, res) => {
     const { name, description, type, brandColor, currency, status, notes } = req.body
     if (!name) return res.status(400).json({ error: 'Name is required' })
-    const logo = req.file ? `/uploads/logos/${req.file.filename}` : ''
+    const logo = req.file ? `/api/files/logos/${req.file.filename}` : ''
     const info = db.prepare(`INSERT INTO businesses (user_id, name, logo, description, type, brand_color, currency, status, notes)
       VALUES (?,?,?,?,?,?,?,?,?)`)
       .run(req.user.id, name, logo, description || '', type || 'other', brandColor || '#7A5AF8', currency || req.user.currency, status || 'active', notes || '')
@@ -182,7 +232,7 @@ async function start() {
     const b = own('businesses', req.user.id, req.params.id)
     if (!b) return res.status(404).json({ error: 'Business not found' })
     const body = req.body
-    const logo = req.file ? `/uploads/logos/${req.file.filename}` : (body.logo === '' ? '' : b.logo)
+    const logo = req.file ? `/api/files/logos/${req.file.filename}` : (body.logo === '' ? '' : b.logo)
     db.prepare(`UPDATE businesses SET name=?, logo=?, description=?, type=?, brand_color=?, currency=?, status=?, notes=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
       .run(body.name ?? b.name, logo, body.description ?? b.description, body.type ?? b.type, body.brandColor ?? b.brand_color, body.currency ?? b.currency, body.status ?? b.status, body.notes ?? b.notes, b.id, req.user.id)
     res.json(own('businesses', req.user.id, b.id))
@@ -223,23 +273,39 @@ async function start() {
     res.json({ ok: true })
   })
 
-  function validateTx(body, userId) {
+  function validateTx(body, userId, { excludeTxId } = {}) {
     const type = body.type
-    const amount = Number(body.amount)
-    if (!type) throw new Error('Type is required')
-    if (!body.date) throw new Error('Date is required')
-    if (!(amount > 0) && type !== 'adjustment') throw new Error('Amount must be greater than zero')
-    if (type === 'transfer') {
-      if (!body.accountId || !body.toAccountId) throw new Error('Transfer requires from and to accounts')
-      if (Number(body.accountId) === Number(body.toAccountId)) throw new Error('Cannot transfer to the same account')
-      if (!own('accounts', userId, body.accountId) || !own('accounts', userId, body.toAccountId)) throw new Error('Account not found')
-    } else if (type !== 'adjustment' || body.accountId) {
-      if (body.accountId && !own('accounts', userId, body.accountId)) throw new Error('Account not found')
+    if (!type || !TX_TYPES.includes(type)) throw new Error('Type is required')
+    if (!isIsoDate(body.date)) throw new Error('Date is required (YYYY-MM-DD)')
+    const amount = parseMoney(body.amount, { allowNegative: type === 'adjustment', field: 'Amount' })
+    const accountId = emptyToNull(body.accountId)
+    const toAccountId = emptyToNull(body.toAccountId)
+    const businessId = emptyToNull(body.businessId)
+    const debtId = emptyToNull(body.debtId)
+    const goalId = emptyToNull(body.goalId)
+    const categoryId = emptyToNull(body.categoryId)
+    if (type === 'transfer' || type === 'investment') {
+      if (!accountId || !toAccountId) throw new Error('Transfer requires from and to accounts')
+      if (sameId(accountId, toAccountId)) throw new Error('Cannot transfer to the same account')
+    } else if (type !== 'adjustment') {
+      if (!accountId) throw new Error('Account is required')
     }
-    if (body.businessId && !own('businesses', userId, body.businessId)) throw new Error('Business not found')
-    if (body.debtId && !own('debts', userId, body.debtId)) throw new Error('Debt not found')
-    if (type === 'debt_payment' && !body.debtId) throw new Error('Debt payment requires a debt')
-    return amount
+    if (accountId && !own('accounts', userId, accountId)) throw new Error('Account not found')
+    if (toAccountId && !own('accounts', userId, toAccountId)) throw new Error('Account not found')
+    if (businessId && !own('businesses', userId, businessId)) throw new Error('Business not found')
+    if (categoryId && !own('categories', userId, categoryId)) throw new Error('Category not found')
+    if (goalId && !own('goals', userId, goalId)) throw new Error('Goal not found')
+    if (debtId && !own('debts', userId, debtId)) throw new Error('Debt not found')
+    if (type === 'debt_payment') {
+      if (!debtId) throw new Error('Debt payment requires a debt')
+      let remaining = toCents(debtBalance(userId, debtId))
+      if (excludeTxId) {
+        const prev = own('transactions', userId, excludeTxId)
+        if (prev && prev.type === 'debt_payment' && sameId(prev.debt_id, debtId)) remaining += toCents(prev.amount)
+      }
+      if (toCents(amount) > remaining) throw new Error('Payment cannot exceed remaining debt')
+    }
+    return { amount, accountId: asId(accountId), toAccountId: asId(toAccountId), businessId: asId(businessId), debtId: asId(debtId), goalId: asId(goalId), categoryId: asId(categoryId) }
   }
 
   api.get('/transactions', (req, res) => {
@@ -261,13 +327,17 @@ async function start() {
   api.post('/transactions', uploadAttach.single('attachment'), (req, res) => {
     try {
       const b = req.body
-      const amount = validateTx(b, req.user.id)
-      const attachment = req.file ? `/uploads/attachments/${req.file.filename}` : (b.attachment || '')
+      const v = validateTx(b, req.user.id)
+      const attachment = req.file ? `/api/files/attachments/${req.file.filename}` : ''
       const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, goal_id, description, notes, tags, attachment, recurring_id)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, amount, b.date, b.type, b.accountId || null, b.toAccountId || null, b.categoryId || null, b.businessId || null, b.debtId || null, b.goalId || null, b.description || '', b.notes || '', parseTags(b.tags), attachment, b.recurringId || null)
-      if (b.debtId) syncDebtBalance(req.user.id, b.debtId)
-      applyGoalDelta(req.user.id, b.goalId, b.type, amount)
+        .run(req.user.id, v.amount, b.date, b.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, v.goalId, b.description || '', b.notes || '', parseTags(b.tags), attachment, asId(emptyToNull(b.recurringId)))
+      if (req.file) {
+        db.prepare('INSERT INTO attachments (user_id, transaction_id, filename, path, mime) VALUES (?,?,?,?,?)')
+          .run(req.user.id, info.lastInsertRowid, req.file.filename, attachment, req.file.mimetype || '')
+      }
+      if (v.debtId) syncDebtBalance(req.user.id, v.debtId)
+      applyGoalDelta(req.user.id, v.goalId, b.type, v.amount)
       recordSnapshot(req.user.id)
       res.json(own('transactions', req.user.id, info.lastInsertRowid))
     } catch (e) { res.status(400).json({ error: e.message }) }
@@ -278,13 +348,28 @@ async function start() {
       const t = own('transactions', req.user.id, req.params.id)
       if (!t) return res.status(404).json({ error: 'Transaction not found' })
       const b = req.body
-      const amount = validateTx({ ...t, ...b, accountId: b.accountId ?? t.account_id, toAccountId: b.toAccountId ?? t.to_account_id, businessId: b.businessId ?? t.business_id, debtId: b.debtId ?? t.debt_id }, req.user.id)
-      const attachment = req.file ? `/uploads/attachments/${req.file.filename}` : (b.attachment === '' ? '' : (b.attachment || t.attachment))
+      const merged = {
+        type: b.type ?? t.type,
+        amount: b.amount ?? t.amount,
+        date: b.date ?? t.date,
+        accountId: b.accountId ?? t.account_id,
+        toAccountId: b.toAccountId ?? t.to_account_id,
+        businessId: b.businessId === undefined ? t.business_id : b.businessId,
+        debtId: b.debtId === undefined ? t.debt_id : b.debtId,
+        goalId: b.goalId === undefined ? t.goal_id : b.goalId,
+        categoryId: b.categoryId === undefined ? t.category_id : b.categoryId
+      }
+      const v = validateTx(merged, req.user.id, { excludeTxId: t.id })
+      const attachment = req.file ? `/api/files/attachments/${req.file.filename}` : (b.attachment === '' ? '' : t.attachment)
       db.prepare(`UPDATE transactions SET amount=?, date=?, type=?, account_id=?, to_account_id=?, category_id=?, business_id=?, debt_id=?, goal_id=?, description=?, notes=?, tags=?, attachment=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
-        .run(amount, b.date ?? t.date, b.type ?? t.type, b.accountId ?? t.account_id, b.toAccountId ?? t.to_account_id, b.categoryId ?? t.category_id, b.businessId ?? t.business_id, b.debtId ?? t.debt_id, b.goalId ?? t.goal_id, b.description ?? t.description, b.notes ?? t.notes, parseTags(b.tags ?? t.tags), attachment, t.id, req.user.id)
+        .run(v.amount, merged.date, merged.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, v.goalId, b.description ?? t.description, b.notes ?? t.notes, parseTags(b.tags ?? t.tags), attachment, t.id, req.user.id)
+      if (req.file) {
+        db.prepare('INSERT INTO attachments (user_id, transaction_id, filename, path, mime) VALUES (?,?,?,?,?)')
+          .run(req.user.id, t.id, req.file.filename, attachment, req.file.mimetype || '')
+      }
       applyGoalDelta(req.user.id, t.goal_id, t.type, -Number(t.amount))
-      applyGoalDelta(req.user.id, b.goalId ?? t.goal_id, b.type ?? t.type, amount)
-      const debtIds = new Set([t.debt_id, b.debtId ?? t.debt_id].filter(Boolean))
+      applyGoalDelta(req.user.id, v.goalId, merged.type, v.amount)
+      const debtIds = new Set([t.debt_id, v.debtId].filter(Boolean))
       for (const id of debtIds) syncDebtBalance(req.user.id, id)
       recordSnapshot(req.user.id)
       res.json(own('transactions', req.user.id, t.id))
@@ -302,14 +387,23 @@ async function start() {
   })
 
   api.post('/transactions/:id/duplicate', (req, res) => {
-    const t = own('transactions', req.user.id, req.params.id)
-    if (!t) return res.status(404).json({ error: 'Transaction not found' })
-    const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, goal_id, description, notes, tags, attachment)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, t.amount, req.body.date || new Date().toISOString().slice(0, 10), t.type, t.account_id, t.to_account_id, t.category_id, t.business_id, t.debt_id, t.goal_id, t.description, t.notes, t.tags, t.attachment)
-    if (t.debt_id) syncDebtBalance(req.user.id, t.debt_id)
-    recordSnapshot(req.user.id)
-    res.json(own('transactions', req.user.id, info.lastInsertRowid))
+    try {
+      const t = own('transactions', req.user.id, req.params.id)
+      if (!t) return res.status(404).json({ error: 'Transaction not found' })
+      const date = isIsoDate(req.body?.date) ? req.body.date : isoDate()
+      const v = validateTx({
+        type: t.type, amount: t.amount, date,
+        accountId: t.account_id, toAccountId: t.to_account_id, businessId: t.business_id,
+        debtId: t.debt_id, goalId: t.goal_id, categoryId: t.category_id
+      }, req.user.id)
+      const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, goal_id, description, notes, tags, attachment)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, v.amount, date, t.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, v.goalId, t.description, t.notes, t.tags, '')
+      if (v.debtId) syncDebtBalance(req.user.id, v.debtId)
+      applyGoalDelta(req.user.id, v.goalId, t.type, v.amount)
+      recordSnapshot(req.user.id)
+      res.json(own('transactions', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.get('/budgets', (req, res) => {
@@ -318,12 +412,15 @@ async function start() {
   })
 
   api.post('/budgets', (req, res) => {
-    const { name, scope, businessId, categoryId, amount, period, startDate, endDate } = req.body
-    if (!name || !(Number(amount) > 0)) return res.status(400).json({ error: 'Name and amount are required' })
-    const info = db.prepare(`INSERT INTO budgets (user_id, name, scope, business_id, category_id, amount, period, start_date, end_date)
-      VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, name, scope || 'overall', businessId || null, categoryId || null, Number(amount), period || 'monthly', startDate || null, endDate || null)
-    res.json(own('budgets', req.user.id, info.lastInsertRowid))
+    try {
+      const { name, scope, businessId, categoryId, amount, period, startDate, endDate } = req.body
+      if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and amount are required' })
+      const amt = parseMoney(amount, { field: 'Amount' })
+      const info = db.prepare(`INSERT INTO budgets (user_id, name, scope, business_id, category_id, amount, period, start_date, end_date)
+        VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), scope || 'overall', asId(emptyToNull(businessId)), asId(emptyToNull(categoryId)), amt, period || 'monthly', startDate || null, endDate || null)
+      res.json(own('budgets', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.put('/budgets/:id', (req, res) => {
@@ -336,12 +433,15 @@ async function start() {
   })
 
   api.get('/debts', (req, res) => {
+    syncAllDebts(req.user.id)
     const sort = req.query.sort || 'interest'
     let rows = db.prepare('SELECT * FROM debts WHERE user_id=?').all(req.user.id)
     rows = rows.map(d => {
-      const paid = round2(Number(d.original_amount) - Number(d.current_balance))
-      const pct = d.original_amount > 0 ? (paid / d.original_amount) * 100 : 0
-      return { ...d, paid, remaining: d.current_balance, percent: round2(pct) }
+      const remaining = debtBalance(req.user.id, d.id)
+      const opening = d.opening_balance != null ? d.opening_balance : d.original_amount
+      const paid = fromCents(Math.max(0, toCents(opening) - toCents(remaining)))
+      const pct = opening > 0 ? (toCents(paid) / toCents(opening)) * 100 : 0
+      return { ...d, current_balance: remaining, paid, remaining, percent: round2(pct) }
     })
     if (sort === 'balance') rows.sort((a, b) => a.current_balance - b.current_balance)
     else if (sort === 'due') rows.sort((a, b) => String(a.due_date || '9999').localeCompare(String(b.due_date || '9999')))
@@ -351,45 +451,62 @@ async function start() {
   })
 
   api.post('/debts', (req, res) => {
-    const { creditor, originalAmount, currentBalance, interest, dueDate, minimumPayment, priority, notes, status, accountId } = req.body
-    if (!creditor || !(Number(originalAmount) > 0)) return res.status(400).json({ error: 'Creditor and original amount are required' })
-    const orig = Number(originalAmount)
-    const cur = currentBalance != null ? Number(currentBalance) : orig
-    const info = db.prepare(`INSERT INTO debts (user_id, creditor, original_amount, current_balance, interest, due_date, minimum_payment, priority, notes, status, account_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, creditor, orig, cur, Number(interest) || 0, dueDate || null, Number(minimumPayment) || 0, priority || 'medium', notes || '', status || 'active', accountId || null)
-    recordSnapshot(req.user.id)
-    res.json(own('debts', req.user.id, info.lastInsertRowid))
+    try {
+      const { creditor, originalAmount, currentBalance, interest, dueDate, minimumPayment, priority, notes, status, accountId } = req.body
+      if (!creditor || !String(creditor).trim()) return res.status(400).json({ error: 'Creditor and original amount are required' })
+      const orig = parseMoney(originalAmount, { field: 'Original amount' })
+      const opening = currentBalance != null && currentBalance !== '' ? parseMoney(currentBalance, { allowZero: true, field: 'Current balance' }) : orig
+      if (opening > orig) throw new Error('Current balance cannot exceed original amount')
+      const acc = emptyToNull(accountId)
+      if (acc && !own('accounts', req.user.id, acc)) throw new Error('Account not found')
+      const info = db.prepare(`INSERT INTO debts (user_id, creditor, original_amount, current_balance, opening_balance, interest, due_date, minimum_payment, priority, notes, status, account_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(creditor).trim(), orig, opening, opening, Number(interest) || 0, dueDate || null, parseMoney(minimumPayment ?? 0, { allowZero: true, field: 'Minimum payment' }), priority || 'medium', notes || '', status || 'active', asId(acc))
+      syncDebtBalance(req.user.id, info.lastInsertRowid)
+      recordSnapshot(req.user.id)
+      res.json(own('debts', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.put('/debts/:id', (req, res) => {
-    const d = own('debts', req.user.id, req.params.id)
-    if (!d) return res.status(404).json({ error: 'Debt not found' })
-    const b = req.body
-    db.prepare(`UPDATE debts SET creditor=?, original_amount=?, interest=?, due_date=?, minimum_payment=?, priority=?, notes=?, status=?, account_id=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
-      .run(b.creditor ?? d.creditor, b.originalAmount ?? d.original_amount, b.interest ?? d.interest, b.dueDate ?? d.due_date, b.minimumPayment ?? d.minimum_payment, b.priority ?? d.priority, b.notes ?? d.notes, b.status ?? d.status, b.accountId === undefined ? d.account_id : b.accountId, d.id, req.user.id)
-    syncDebtBalance(req.user.id, d.id)
-    recordSnapshot(req.user.id)
-    res.json(own('debts', req.user.id, d.id))
+    try {
+      const d = own('debts', req.user.id, req.params.id)
+      if (!d) return res.status(404).json({ error: 'Debt not found' })
+      const b = req.body
+      const orig = b.originalAmount === undefined ? d.original_amount : parseMoney(b.originalAmount, { field: 'Original amount' })
+      const acc = b.accountId === undefined ? d.account_id : emptyToNull(b.accountId)
+      if (acc && !own('accounts', req.user.id, acc)) throw new Error('Account not found')
+      db.prepare(`UPDATE debts SET creditor=?, original_amount=?, interest=?, due_date=?, minimum_payment=?, priority=?, notes=?, status=?, account_id=?, updated_at=datetime('now') WHERE id=? AND user_id=?`)
+        .run(b.creditor ?? d.creditor, orig, b.interest ?? d.interest, b.dueDate ?? d.due_date, b.minimumPayment ?? d.minimum_payment, b.priority ?? d.priority, b.notes ?? d.notes, b.status ?? d.status, asId(acc), d.id, req.user.id)
+      syncDebtBalance(req.user.id, d.id)
+      recordSnapshot(req.user.id)
+      res.json(own('debts', req.user.id, d.id))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.get('/goals', (req, res) => {
     const rows = db.prepare('SELECT * FROM goals WHERE user_id=?').all(req.user.id).map(g => {
-      const current = g.account_id ? accountBalance(req.user.id, g.account_id) : Number(g.current_amount)
-      const remaining = round2(Math.max(0, g.target_amount - current))
-      const percent = g.target_amount > 0 ? round2((current / g.target_amount) * 100) : 0
+      const current = g.account_id ? accountBalance(req.user.id, g.account_id) : fromCents(toCents(g.current_amount))
+      const remaining = round2(Math.max(0, fromCents(toCents(g.target_amount) - toCents(current))))
+      const percent = g.target_amount > 0 ? round2((toCents(current) / toCents(g.target_amount)) * 100) : 0
       return { ...g, current, remaining, percent }
     })
     res.json(rows)
   })
 
   api.post('/goals', (req, res) => {
-    const { name, targetAmount, currentAmount, targetDate, priority, accountId, notes } = req.body
-    if (!name || !(Number(targetAmount) > 0)) return res.status(400).json({ error: 'Name and target amount are required' })
-    const info = db.prepare(`INSERT INTO goals (user_id, name, target_amount, current_amount, target_date, priority, account_id, notes)
-      VALUES (?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, name, Number(targetAmount), Number(currentAmount) || 0, targetDate || null, priority || 'medium', accountId || null, notes || '')
-    res.json(own('goals', req.user.id, info.lastInsertRowid))
+    try {
+      const { name, targetAmount, currentAmount, targetDate, priority, accountId, notes } = req.body
+      if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and target amount are required' })
+      const target = parseMoney(targetAmount, { field: 'Target amount' })
+      const current = parseMoney(currentAmount ?? 0, { allowZero: true, field: 'Current amount' })
+      const acc = emptyToNull(accountId)
+      if (acc && !own('accounts', req.user.id, acc)) throw new Error('Account not found')
+      const info = db.prepare(`INSERT INTO goals (user_id, name, target_amount, current_amount, target_date, priority, account_id, notes)
+        VALUES (?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), target, current, targetDate || null, priority || 'medium', asId(acc), notes || '')
+      res.json(own('goals', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.put('/goals/:id', (req, res) => {
@@ -406,12 +523,17 @@ async function start() {
   })
 
   api.post('/recurring', (req, res) => {
-    const { amount, frequency, startDate, endDate, accountId, toAccountId, categoryId, businessId, debtId, type, description } = req.body
-    if (!(Number(amount) > 0) || !frequency || !startDate || !type) return res.status(400).json({ error: 'Amount, frequency, start date and type are required' })
-    const info = db.prepare(`INSERT INTO recurring_transactions (user_id, amount, frequency, start_date, end_date, next_date, account_id, to_account_id, category_id, business_id, debt_id, type, description)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, Number(amount), frequency, startDate, endDate || null, startDate, accountId || null, toAccountId || null, categoryId || null, businessId || null, debtId || null, type, description || '')
-    res.json(own('recurring_transactions', req.user.id, info.lastInsertRowid))
+    try {
+      const { amount, frequency, startDate, endDate, accountId, toAccountId, categoryId, businessId, debtId, type, description } = req.body
+      if (!frequency || !isIsoDate(startDate) || !type || !TX_TYPES.includes(type)) return res.status(400).json({ error: 'Amount, frequency, start date and type are required' })
+      const amt = parseMoney(amount, { field: 'Amount' })
+      if (accountId && !own('accounts', req.user.id, accountId)) throw new Error('Account not found')
+      if (toAccountId && !own('accounts', req.user.id, toAccountId)) throw new Error('Account not found')
+      const info = db.prepare(`INSERT INTO recurring_transactions (user_id, amount, frequency, start_date, end_date, next_date, account_id, to_account_id, category_id, business_id, debt_id, type, description)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, amt, frequency, startDate, endDate || null, startDate, asId(emptyToNull(accountId)), asId(emptyToNull(toAccountId)), asId(emptyToNull(categoryId)), asId(emptyToNull(businessId)), asId(emptyToNull(debtId)), type, description || '')
+      res.json(own('recurring_transactions', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.put('/recurring/:id', (req, res) => {
@@ -424,17 +546,24 @@ async function start() {
   })
 
   api.post('/recurring/:id/confirm', (req, res) => {
-    const r = own('recurring_transactions', req.user.id, req.params.id)
-    if (!r) return res.status(404).json({ error: 'Not found' })
-    const date = req.body.date || r.next_date
-    const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, description, recurring_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, r.amount, date, r.type, r.account_id, r.to_account_id, r.category_id, r.business_id, r.debt_id, r.description, r.id)
-    const next = nextRecurringDate(date, r.frequency)
-    db.prepare('UPDATE recurring_transactions SET next_date=? WHERE id=? AND user_id=?').run(next, r.id, req.user.id)
-    if (r.debt_id) syncDebtBalance(req.user.id, r.debt_id)
-    recordSnapshot(req.user.id)
-    res.json(own('transactions', req.user.id, info.lastInsertRowid))
+    try {
+      const r = own('recurring_transactions', req.user.id, req.params.id)
+      if (!r) return res.status(404).json({ error: 'Not found' })
+      const date = isIsoDate(req.body?.date) ? req.body.date : r.next_date
+      const v = validateTx({
+        type: r.type, amount: r.amount, date,
+        accountId: r.account_id, toAccountId: r.to_account_id, businessId: r.business_id,
+        debtId: r.debt_id, categoryId: r.category_id
+      }, req.user.id)
+      const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, description, recurring_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, v.amount, date, r.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, r.description, r.id)
+      const next = nextRecurringDate(date, r.frequency)
+      db.prepare('UPDATE recurring_transactions SET next_date=? WHERE id=? AND user_id=?').run(next, r.id, req.user.id)
+      if (v.debtId) syncDebtBalance(req.user.id, v.debtId)
+      recordSnapshot(req.user.id)
+      res.json(own('transactions', req.user.id, info.lastInsertRowid))
+    } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
   api.get('/allocations', (req, res) => {
@@ -466,6 +595,8 @@ async function start() {
   })
 
   api.get('/dashboard', (req, res) => {
+    syncAllDebts(req.user.id)
+    refreshNotifications(req.user.id)
     const range = periodRange(req.query.period || 'month', req.query.from, req.query.to)
     const scope = req.query.scope || 'all'
     const businessId = req.query.businessId
@@ -519,8 +650,11 @@ async function start() {
   api.post('/afford', (req, res) => res.json(affordability(req.user.id, req.body.amount)))
 
   api.get('/calendar', (req, res) => {
-    const from = req.query.from || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10)
-    const to = req.query.to || new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).toISOString().slice(0, 10)
+    const today = isoDate()
+    const [y, m] = today.split('-').map(Number)
+    const last = new Date(Date.UTC(y, m, 0)).getUTCDate()
+    const from = isIsoDate(req.query.from) ? req.query.from : `${y}-${String(m).padStart(2, '0')}-01`
+    const to = isIsoDate(req.query.to) ? req.query.to : `${y}-${String(m).padStart(2, '0')}-${String(last).padStart(2, '0')}`
     const events = []
     const debts = db.prepare("SELECT * FROM debts WHERE user_id=? AND due_date IS NOT NULL AND due_date>=? AND due_date<=?").all(req.user.id, from, to)
     for (const d of debts) events.push({ date: d.due_date, kind: 'debt', status: d.status === 'overdue' ? 'overdue' : 'expected', title: `${d.creditor} due`, amount: d.minimum_payment || d.current_balance, id: d.id })
@@ -552,7 +686,35 @@ async function start() {
   })
 
   api.get('/notifications', (req, res) => {
+    refreshNotifications(req.user.id)
     res.json(db.prepare('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50').all(req.user.id))
+  })
+
+  api.post('/notifications/:id/read', (req, res) => {
+    const n = own('notifications', req.user.id, req.params.id)
+    if (!n) return res.status(404).json({ error: 'Not found' })
+    db.prepare('UPDATE notifications SET read=1 WHERE id=? AND user_id=?').run(n.id, req.user.id)
+    res.json({ ok: true })
+  })
+
+  api.get('/files/:kind/:filename', (req, res) => {
+    const kind = req.params.kind
+    if (kind !== 'logos' && kind !== 'attachments') return res.status(404).json({ error: 'Not found' })
+    const filename = path.basename(req.params.filename)
+    if (!filename || filename.includes('..')) return res.status(400).json({ error: 'Invalid file' })
+    const apiPath = `/api/files/${kind}/${filename}`
+    const legacy = `/uploads/${kind}/${filename}`
+    let owned = false
+    if (kind === 'logos') {
+      owned = !!db.prepare('SELECT id FROM businesses WHERE user_id=? AND logo IN (?,?)').get(req.user.id, apiPath, legacy)
+    } else {
+      owned = !!db.prepare('SELECT id FROM transactions WHERE user_id=? AND attachment IN (?,?)').get(req.user.id, apiPath, legacy)
+        || !!db.prepare('SELECT id FROM attachments WHERE user_id=? AND (filename=? OR path IN (?,?))').get(req.user.id, filename, apiPath, legacy)
+    }
+    if (!owned) return res.status(404).json({ error: 'Not found' })
+    const full = path.join(uploadsDir, kind, filename)
+    if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' })
+    res.sendFile(full)
   })
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'Finance OS' }))
@@ -592,15 +754,13 @@ function applyGoalDelta(userId, goalId, type, amount) {
 }
 
 function nextRecurringDate(date, frequency) {
-  const d = new Date(date + 'T00:00:00')
-  if (frequency === 'weekly') d.setDate(d.getDate() + 7)
-  else if (frequency === 'biweekly') d.setDate(d.getDate() + 14)
-  else if (frequency === 'yearly') d.setFullYear(d.getFullYear() + 1)
-  else d.setMonth(d.getMonth() + 1)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  const [y0, m0, d0] = String(date).split('-').map(Number)
+  const d = new Date(Date.UTC(y0, m0 - 1, d0))
+  if (frequency === 'weekly') d.setUTCDate(d.getUTCDate() + 7)
+  else if (frequency === 'biweekly') d.setUTCDate(d.getUTCDate() + 14)
+  else if (frequency === 'yearly') d.setUTCFullYear(d.getUTCFullYear() + 1)
+  else d.setUTCMonth(d.getUTCMonth() + 1)
+  return d.toISOString().slice(0, 10)
 }
 
 start().catch(err => {

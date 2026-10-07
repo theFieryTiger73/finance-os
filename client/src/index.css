@@ -186,4 +186,10 @@ img { max-width: 100%; }
   .kpis, .cards-3, .cards-2 { grid-template-columns: 1fr; }
   .page { padding: 14px; }
   .table-wrap { overflow: auto; }
+  .cal { grid-template-columns: repeat(7, minmax(36px, 1fr)); overflow: auto; }
+  .cal .day { min-height: 64px; font-size: 11px; }
+  .modal { width: 100%; border-radius: 18px 18px 0 0; }
+  .topbar .btn.sm:last-child { display: none; }
+  .search input { font-size: 16px; }
 }
+.btn:disabled { opacity: 0.6; cursor: not-allowed; }

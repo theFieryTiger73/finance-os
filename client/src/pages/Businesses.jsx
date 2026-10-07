@@ -6,6 +6,8 @@ import { Empty, Field, Modal } from '../components.jsx'
 export default function Businesses({ user }) {
   const [rows, setRows] = useState([])
   const [form, setForm] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const c = user.currency
 
   async function load() { setRows(await api('/businesses')) }
@@ -13,14 +15,19 @@ export default function Businesses({ user }) {
 
   async function save(e) {
     e.preventDefault()
-    const fd = new FormData()
-    ;['name', 'description', 'type', 'brandColor', 'currency', 'status', 'notes'].forEach(k => {
-      if (form[k] != null) fd.append(k, form[k])
-    })
-    if (form.file) fd.append('logo', form.file)
-    if (form.id) await api(`/businesses/${form.id}`, { method: 'PUT', form: fd })
-    else await api('/businesses', { method: 'POST', form: fd })
-    setForm(null); load()
+    if (busy) return
+    setErr(''); setBusy(true)
+    try {
+      const fd = new FormData()
+      ;['name', 'description', 'type', 'brandColor', 'currency', 'status', 'notes'].forEach(k => {
+        if (form[k] != null) fd.append(k, form[k])
+      })
+      if (form.file) fd.append('logo', form.file)
+      if (form.id) await api(`/businesses/${form.id}`, { method: 'PUT', form: fd })
+      else await api('/businesses', { method: 'POST', form: fd })
+      setForm(null); load()
+    } catch (ex) { setErr(ex.message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -58,7 +65,8 @@ export default function Businesses({ user }) {
             <Field label="Logo (PNG, JPG, WebP, SVG)"><input type="file" accept=".png,.jpg,.jpeg,.webp,.svg,image/*" onChange={e => setForm({ ...form, file: e.target.files[0] })} /></Field>
             <Field label="Notes"><textarea value={form.notes || ''} onChange={e => setForm({ ...form, notes: e.target.value })} /></Field>
             <Field label="Status"><select value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}><option>active</option><option>archived</option></select></Field>
-            <button className="btn">Save</button>
+            {err && <div className="err">{err}</div>}
+            <button className="btn" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </form>
         </Modal>
       )}

@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react'
-import { api, money } from '../api.js'
+import { api, money, today } from '../api.js'
 import { Empty, Field, Modal } from '../components.jsx'
 
 export default function CalendarPage({ user }) {
-  const now = new Date()
-  const [ym, setYm] = useState(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`)
+  const [ym, setYm] = useState(() => today().slice(0, 7))
   const [data, setData] = useState({ events: [] })
   const [rec, setRec] = useState([])
   const [form, setForm] = useState(null)
@@ -13,7 +12,7 @@ export default function CalendarPage({ user }) {
   async function load() {
     const [y, m] = ym.split('-').map(Number)
     const from = `${ym}-01`
-    const last = new Date(y, m, 0).getDate()
+    const last = new Date(Date.UTC(y, m, 0)).getUTCDate()
     const to = `${ym}-${String(last).padStart(2, '0')}`
     setData(await api(`/calendar?from=${from}&to=${to}`))
     setRec(await api('/recurring'))
@@ -22,8 +21,8 @@ export default function CalendarPage({ user }) {
   useEffect(() => { load() }, [ym])
 
   const [y, m] = ym.split('-').map(Number)
-  const first = new Date(y, m - 1, 1).getDay()
-  const days = new Date(y, m, 0).getDate()
+  const first = new Date(Date.UTC(y, m - 1, 1)).getUTCDay()
+  const days = new Date(Date.UTC(y, m, 0)).getUTCDate()
   const cells = Array.from({ length: first }, () => null).concat(Array.from({ length: days }, (_, i) => i + 1))
 
   async function saveRec(e) {

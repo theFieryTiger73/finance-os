@@ -21,6 +21,15 @@ const NAV = [
   ['/settings', 'Settings', Settings]
 ]
 
+const SEARCH_HREF = {
+  transactions: '/transactions',
+  accounts: '/accounts',
+  businesses: '/businesses',
+  debts: '/debts',
+  goals: '/goals',
+  categories: '/budget'
+}
+
 export default function Layout({ user, setUser }) {
   const [open, setOpen] = useState(false)
   const [q, setQ] = useState('')
@@ -28,16 +37,28 @@ export default function Layout({ user, setUser }) {
   const [txOpen, setTxOpen] = useState(false)
   const [fabOpen, setFabOpen] = useState(false)
   const [preset, setPreset] = useState(null)
+  const [notes, setNotes] = useState([])
+  const [showNotes, setShowNotes] = useState(false)
   const nav = useNavigate()
   const loc = useLocation()
   const lookups = useLookups()
 
   useEffect(() => { setOpen(false); setResults(null); setQ('') }, [loc.pathname])
+  useEffect(() => {
+    api('/notifications').then(setNotes).catch(() => {})
+  }, [loc.pathname])
 
   async function search(v) {
     setQ(v)
     if (!v.trim()) return setResults(null)
-    setResults(await api(`/search?q=${encodeURIComponent(v)}`))
+    try { setResults(await api(`/search?q=${encodeURIComponent(v)}`)) }
+    catch { setResults({ transactions: [], accounts: [], businesses: [], debts: [], goals: [], categories: [] }) }
+  }
+
+  function goSearch(kind, r) {
+    setResults(null); setQ('')
+    if (kind === 'businesses') return nav(`/businesses/${r.id}`)
+    nav(SEARCH_HREF[kind] || '/')
   }
 
   function logout() {
@@ -79,8 +100,22 @@ export default function Layout({ user, setUser }) {
             <Search size={16} />
             <input placeholder="Search transactions, accounts, businesses, debts, goals..." value={q} onChange={e => search(e.target.value)} />
           </div>
+          <button className="btn sm ghost" onClick={() => setShowNotes(s => !s)}>
+            {notes.filter(n => !n.read).length ? `${notes.filter(n => !n.read).length} alerts` : 'Alerts'}
+          </button>
           <button className="btn sm" onClick={() => { setPreset(null); setTxOpen(true) }}>+ Transaction</button>
         </header>
+        {showNotes && (
+          <div className="search-panel">
+            {notes.length ? notes.map(n => (
+              <div key={n.id} style={{ padding: 12, borderBottom: '1px solid var(--line)' }}>
+                <strong>{n.title}</strong>
+                <div className="sub">{n.message}</div>
+                {!n.read && <button className="btn ghost sm" onClick={async () => { await api(`/notifications/${n.id}/read`, { method: 'POST' }); setNotes(x => x.map(i => i.id === n.id ? { ...i, read: 1 } : i)) }}>Mark read</button>}
+              </div>
+            )) : <div className="empty">No alerts.</div>}
+          </div>
+        )}
         {results && (
           <div className="search-panel">
             {['transactions', 'accounts', 'businesses', 'debts', 'goals', 'categories'].map(k => (
@@ -88,9 +123,9 @@ export default function Layout({ user, setUser }) {
                 <div key={k} style={{ padding: 12 }}>
                   <strong style={{ textTransform: 'capitalize', fontSize: 12, color: 'var(--muted)' }}>{k}</strong>
                   {results[k].map(r => (
-                    <div key={r.id} style={{ padding: '6px 0', borderBottom: '1px solid var(--line)' }}>
+                    <button key={r.id} className="linkish" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '6px 0', border: 0, background: 'none', borderBottom: '1px solid var(--line)', color: 'inherit' }} onClick={() => goSearch(k, r)}>
                       {r.name || r.creditor || r.description || r.type}
-                    </div>
+                    </button>
                   ))}
                 </div>
               ) : null

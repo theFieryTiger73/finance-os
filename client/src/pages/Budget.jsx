@@ -7,6 +7,8 @@ export default function Budget({ user }) {
   const [cats, setCats] = useState([])
   const [biz, setBiz] = useState([])
   const [form, setForm] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const c = user.currency
 
   async function load() {
@@ -18,9 +20,14 @@ export default function Budget({ user }) {
 
   async function save(e) {
     e.preventDefault()
-    if (form.id) await api(`/budgets/${form.id}`, { method: 'PUT', body: form })
-    else await api('/budgets', { method: 'POST', body: form })
-    setForm(null); load()
+    if (busy) return
+    setErr(''); setBusy(true)
+    try {
+      if (form.id) await api(`/budgets/${form.id}`, { method: 'PUT', body: form })
+      else await api('/budgets', { method: 'POST', body: form })
+      setForm(null); load()
+    } catch (ex) { setErr(ex.message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -58,7 +65,8 @@ export default function Budget({ user }) {
             )}
             <Field label="Amount"><input type="number" step="0.01" required value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} /></Field>
             <Field label="Period"><select value={form.period} onChange={e => setForm({ ...form, period: e.target.value })}><option>monthly</option><option>quarterly</option><option>yearly</option></select></Field>
-            <button className="btn">Save</button>
+            {err && <div className="err">{err}</div>}
+            <button className="btn" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </form>
         </Modal>
       )}

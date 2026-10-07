@@ -1,7 +1,15 @@
 const TOKEN_KEY = 'financeos_token'
 
 export function getToken() { return localStorage.getItem(TOKEN_KEY) }
-export function setToken(t) { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY) }
+export function setToken(t) {
+  if (t) {
+    localStorage.setItem(TOKEN_KEY, t)
+    document.cookie = `fos_token=${encodeURIComponent(t)}; path=/; SameSite=Lax; max-age=${14 * 24 * 3600}`
+  } else {
+    localStorage.removeItem(TOKEN_KEY)
+    document.cookie = 'fos_token=; path=/; max-age=0'
+  }
+}
 
 export async function api(path, { method = 'GET', body, form } = {}) {
   const headers = { Authorization: getToken() ? `Bearer ${getToken()}` : '' }
@@ -47,6 +55,10 @@ export function initials(name = '') {
 }
 
 export function today() {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Maputo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
+  } catch {
+    const d = new Date()
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
 }

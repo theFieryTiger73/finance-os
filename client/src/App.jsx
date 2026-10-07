@@ -151,7 +151,7 @@ function Onboarding({ user, setUser }) {
   return (
     <div className="auth">
       <div className="auth-card">
-        <p style={{ color: 'var(--muted)', margin: 0 }}>Welcome to {user.firstName}'s Finance OS</p>
+        <p style={{ color: 'var(--muted)', margin: 0 }}>Welcome to {user.brandName}</p>
         <h1>Set up in five optional steps</h1>
         <p className="sub">Step {Math.min(step, 5)} of 5. Skip anything you do not have yet. No sample data is created.</p>
         {err && <div className="err">{err}</div>}
@@ -243,6 +243,7 @@ export default function App() {
 
   useEffect(() => {
     if (!getToken()) return setLoading(false)
+    setToken(getToken())
     api('/me').then(setUser).catch(() => setToken(null)).finally(() => setLoading(false))
   }, [])
 

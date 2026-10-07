@@ -20,9 +20,16 @@ export function signToken(user) {
   return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '14d' })
 }
 
-export function authMiddleware(req, res, next) {
+function tokenFromRequest(req) {
   const header = req.headers.authorization || ''
-  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token || '')
+  if (header.startsWith('Bearer ')) return header.slice(7)
+  const cookie = req.headers.cookie || ''
+  const m = cookie.match(/(?:^|; )fos_token=([^;]+)/)
+  return m ? decodeURIComponent(m[1]) : ''
+}
+
+export function authMiddleware(req, res, next) {
+  const token = tokenFromRequest(req)
   if (!token) return res.status(401).json({ error: 'Authentication required' })
   try {
     const payload = jwt.verify(token, JWT_SECRET)
@@ -50,8 +57,14 @@ export function publicUser(u) {
     onboardingStep: u.onboarding_step,
     emergencyFundTarget: u.emergency_fund_target,
     minLiquidity: u.min_liquidity,
-    brandName: `${u.first_name}'s Finance OS`
+    brandName: possessiveBrand(u.first_name)
   }
+}
+
+export function possessiveBrand(firstName) {
+  const name = String(firstName || '').trim() || 'User'
+  const suffix = /s$/i.test(name) ? "'" : "'s"
+  return `${name}${suffix} Finance OS`
 }
 
 export function register({ firstName, lastName, email, password, country, currency }) {

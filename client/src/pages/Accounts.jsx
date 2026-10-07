@@ -8,6 +8,8 @@ export default function Accounts({ user }) {
   const [rows, setRows] = useState([])
   const [form, setForm] = useState(null)
   const [history, setHistory] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const c = user.currency
 
   async function load() { setRows(await api('/accounts')) }
@@ -15,9 +17,14 @@ export default function Accounts({ user }) {
 
   async function save(e) {
     e.preventDefault()
-    if (form.id) await api(`/accounts/${form.id}`, { method: 'PUT', body: form })
-    else await api('/accounts', { method: 'POST', body: form })
-    setForm(null); load()
+    if (busy) return
+    setErr(''); setBusy(true)
+    try {
+      if (form.id) await api(`/accounts/${form.id}`, { method: 'PUT', body: form })
+      else await api('/accounts', { method: 'POST', body: form })
+      setForm(null); load()
+    } catch (ex) { setErr(ex.message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -56,7 +63,8 @@ export default function Accounts({ user }) {
             <Field label="Color"><input type="color" value={form.color} onChange={e => setForm({ ...form, color: e.target.value })} /></Field>
             <Field label="Notes"><textarea value={form.notes || ''} onChange={e => setForm({ ...form, notes: e.target.value })} /></Field>
             <Field label="Status"><select value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}><option>active</option><option>archived</option></select></Field>
-            <button className="btn">Save</button>
+            {err && <div className="err">{err}</div>}
+            <button className="btn" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </form>
         </Modal>
       )}

@@ -229,6 +229,20 @@ CREATE TABLE IF NOT EXISTS allocation_rules (
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_businesses_user ON businesses(user_id);
+CREATE INDEX IF NOT EXISTS idx_categories_user ON categories(user_id);
+CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_tx_account ON transactions(user_id, account_id);
+CREATE INDEX IF NOT EXISTS idx_tx_to_account ON transactions(user_id, to_account_id);
+CREATE INDEX IF NOT EXISTS idx_tx_business ON transactions(user_id, business_id);
+CREATE INDEX IF NOT EXISTS idx_tx_debt ON transactions(user_id, debt_id);
+CREATE INDEX IF NOT EXISTS idx_debts_user ON debts(user_id);
+CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
+CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_user_date ON financial_snapshots(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_attachments_user ON attachments(user_id);
 `)
 
 export function seedDefaultCategories(userId) {
@@ -266,6 +280,17 @@ export function seedDefaultCategories(userId) {
     db.exec('ROLLBACK')
     throw e
   }
+}
+
+try {
+  db.exec('ALTER TABLE debts ADD COLUMN opening_balance REAL')
+} catch { /* already exists */ }
+
+const debtsNeedOpening = db.prepare('SELECT id, original_amount, current_balance FROM debts WHERE opening_balance IS NULL').all()
+const setOpening = db.prepare('UPDATE debts SET opening_balance = ? WHERE id = ?')
+for (const d of debtsNeedOpening) {
+  const paid = db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE debt_id = ? AND type = 'debt_payment'").get(d.id).s
+  setOpening.run(Number(d.current_balance) + Number(paid || 0), d.id)
 }
 
 export { db, dataDir, uploadsDir }

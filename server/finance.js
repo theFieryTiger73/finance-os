@@ -1,4 +1,5 @@
 import { db } from './db.js'
+import { toCents, fromCents, sameId, isoDate as maputoDate } from './money.js'
 
 export const ACCOUNT_TYPES = [
   'cash', 'bank', 'mobile_money', 'savings', 'credit_card', 'digital_wallet', 'investment', 'other'
@@ -11,41 +12,44 @@ export const LIABILITY_ACCOUNT_TYPES = new Set(['credit_card'])
 export const CASH_TYPES = new Set(['cash', 'bank', 'mobile_money', 'savings', 'digital_wallet'])
 
 export function isoDate(d = new Date()) {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  return maputoDate(d)
+}
+
+function maputoYmd(d = new Date()) {
+  const s = maputoDate(d)
+  const [y, m, day] = s.split('-').map(Number)
+  return { y, m, day, s }
+}
+
+function monthEnd(y, m) {
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate()
+  return `${y}-${String(m).padStart(2, '0')}-${String(last).padStart(2, '0')}`
 }
 
 export function periodRange(period, customFrom, customTo) {
-  const now = new Date()
-  const y = now.getFullYear()
-  const m = now.getMonth()
-  if (period === 'year') return { from: `${y}-01-01`, to: isoDate(now) }
+  const { y, m, s } = maputoYmd()
+  if (period === 'year') return { from: `${y}-01-01`, to: s }
   if (period === 'quarter') {
-    const q = Math.floor(m / 3) * 3
-    return { from: `${y}-${String(q + 1).padStart(2, '0')}-01`, to: isoDate(now) }
+    const q = Math.floor((m - 1) / 3) * 3 + 1
+    return { from: `${y}-${String(q).padStart(2, '0')}-01`, to: s }
   }
   if (period === 'custom' && customFrom && customTo) return { from: customFrom, to: customTo }
-  const from = `${y}-${String(m + 1).padStart(2, '0')}-01`
-  return { from, to: isoDate(now) }
+  return { from: `${y}-${String(m).padStart(2, '0')}-01`, to: s }
 }
 
 export function accountBalance(userId, accountId) {
   const acc = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(accountId, userId)
   if (!acc) return 0
   const txs = db.prepare('SELECT * FROM transactions WHERE user_id = ? AND (account_id = ? OR to_account_id = ?)').all(userId, accountId, accountId)
-  let bal = Number(acc.initial_balance) || 0
-  for (const t of txs) {
-    const amt = Number(t.amount) || 0
-    bal += effectOnAccount(t, accountId, amt)
-  }
-  return round2(bal)
+  let cents = toCents(acc.initial_balance)
+  for (const t of txs) cents += effectOnAccountCents(t, accountId)
+  return fromCents(cents)
 }
 
-function effectOnAccount(t, accountId, amt) {
-  const from = t.account_id === accountId
-  const to = t.to_account_id === accountId
+function effectOnAccountCents(t, accountId) {
+  const amt = toCents(t.amount)
+  const from = sameId(t.account_id, accountId)
+  const to = sameId(t.to_account_id, accountId)
   switch (t.type) {
     case 'income':
     case 'owner_contribution':
@@ -56,9 +60,6 @@ function effectOnAccount(t, accountId, amt) {
     case 'debt_payment':
       return from ? -amt : 0
     case 'transfer':
-      if (from) return -amt
-      if (to) return amt
-      return 0
     case 'investment':
       if (from) return -amt
       if (to) return amt
@@ -70,28 +71,34 @@ function effectOnAccount(t, accountId, amt) {
   }
 }
 
-export function allAccountBalances(userId) {
-  const accounts = db.prepare("SELECT * FROM accounts WHERE user_id = ? AND status != 'archived'").all(userId)
+export function allAccountBalances(userId, { includeArchived = false } = {}) {
+  const sql = includeArchived
+    ? 'SELECT * FROM accounts WHERE user_id = ?'
+    : "SELECT * FROM accounts WHERE user_id = ? AND status != 'archived'"
+  const accounts = db.prepare(sql).all(userId)
   return accounts.map(a => ({ ...a, balance: accountBalance(userId, a.id) }))
 }
 
 export function debtBalance(userId, debtId) {
   const d = db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
   if (!d) return 0
+  const opening = d.opening_balance != null ? d.opening_balance : d.original_amount
   const paid = db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND debt_id = ? AND type = 'debt_payment'").get(userId, debtId).s
-  return round2(Math.max(0, Number(d.original_amount) - Number(paid)))
+  return fromCents(Math.max(0, toCents(opening) - toCents(paid)))
 }
 
 export function syncDebtBalance(userId, debtId) {
+  const d = db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
+  if (!d) return 0
   const remaining = debtBalance(userId, debtId)
-  const status = remaining <= 0.005 ? 'paid' : undefined
-  if (status) {
-    db.prepare("UPDATE debts SET current_balance = ?, status = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
-      .run(remaining, status, debtId, userId)
-  } else {
-    db.prepare("UPDATE debts SET current_balance = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
-      .run(remaining, debtId, userId)
+  let status = d.status
+  if (d.status !== 'archived') {
+    if (remaining <= 0) status = 'paid'
+    else if (d.due_date && d.due_date < isoDate() && remaining > 0) status = 'overdue'
+    else if (status === 'paid' || status === 'overdue') status = 'active'
   }
+  db.prepare("UPDATE debts SET current_balance = ?, status = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
+    .run(remaining, status, debtId, userId)
   return remaining
 }
 
@@ -99,35 +106,41 @@ export function goalProgress(userId, goalId) {
   const g = db.prepare('SELECT * FROM goals WHERE id = ? AND user_id = ?').get(goalId, userId)
   if (!g) return 0
   if (g.account_id) return accountBalance(userId, g.account_id)
-  return Number(g.current_amount) || 0
+  return fromCents(toCents(g.current_amount))
+}
+
+export function syncAllDebts(userId) {
+  const rows = db.prepare("SELECT id FROM debts WHERE user_id = ? AND status != 'archived'").all(userId)
+  for (const d of rows) syncDebtBalance(userId, d.id)
 }
 
 export function netWorth(userId) {
-  const accounts = allAccountBalances(userId)
-  let assets = 0
-  let liabilities = 0
-  let cash = 0
+  const accounts = allAccountBalances(userId, { includeArchived: true })
+  let assetCents = 0
+  let liabilityCents = 0
+  let cashCents = 0
   for (const a of accounts) {
+    const c = toCents(a.balance)
     if (LIABILITY_ACCOUNT_TYPES.has(a.type)) {
-      liabilities += Math.abs(a.balance)
+      liabilityCents += Math.abs(c)
     } else {
-      assets += a.balance
-      if (CASH_TYPES.has(a.type)) cash += a.balance
+      assetCents += c
+      if (CASH_TYPES.has(a.type) && a.status !== 'archived') cashCents += c
     }
   }
   const debts = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
-  let debtTotal = 0
+  let debtCents = 0
   for (const d of debts) {
-    const bal = Number(d.current_balance)
-    debtTotal += bal
-    liabilities += bal
+    const bal = toCents(debtBalance(userId, d.id))
+    debtCents += bal
+    liabilityCents += bal
   }
   return {
-    assets: round2(assets),
-    liabilities: round2(liabilities),
-    netWorth: round2(assets - liabilities),
-    cash: round2(cash),
-    debt: round2(debtTotal)
+    assets: fromCents(assetCents),
+    liabilities: fromCents(liabilityCents),
+    netWorth: fromCents(assetCents - liabilityCents),
+    cash: fromCents(cashCents),
+    debt: fromCents(debtCents)
   }
 }
 
@@ -161,9 +174,9 @@ function txFilter(userId, { from, to, scope, businessId }) {
 
 export function periodStats(userId, opts = {}) {
   const txs = txFilter(userId, opts)
-  let income = 0, expenses = 0, businessRevenue = 0, businessExpenses = 0, ownerDraws = 0, ownerContrib = 0
+  let income = 0, expenses = 0, businessRevenue = 0, businessExpenses = 0, ownerDraws = 0, ownerContrib = 0, debtPayments = 0
   for (const t of txs) {
-    const amt = Number(t.amount) || 0
+    const amt = toCents(t.amount)
     if (t.type === 'income') {
       income += amt
       if (t.business_id) businessRevenue += amt
@@ -177,17 +190,20 @@ export function periodStats(userId, opts = {}) {
       ownerDraws += amt
     } else if (t.type === 'owner_contribution') {
       ownerContrib += amt
+    } else if (t.type === 'debt_payment') {
+      debtPayments += amt
     }
   }
   return {
-    income: round2(income),
-    expenses: round2(Math.max(0, expenses)),
-    netCashFlow: round2(income - expenses),
-    businessRevenue: round2(businessRevenue),
-    businessExpenses: round2(Math.max(0, businessExpenses)),
-    businessProfit: round2(businessRevenue - businessExpenses),
-    ownerDraws: round2(ownerDraws),
-    ownerContributions: round2(ownerContrib)
+    income: fromCents(income),
+    expenses: fromCents(Math.max(0, expenses)),
+    netCashFlow: fromCents(income - expenses),
+    businessRevenue: fromCents(businessRevenue),
+    businessExpenses: fromCents(Math.max(0, businessExpenses)),
+    businessProfit: fromCents(businessRevenue - businessExpenses),
+    ownerDraws: fromCents(ownerDraws),
+    ownerContributions: fromCents(ownerContrib),
+    debtPayments: fromCents(debtPayments)
   }
 }
 
@@ -197,12 +213,17 @@ export function cashFlowSeries(userId, opts = {}) {
   for (const t of txs) {
     const d = t.date.slice(0, 10)
     if (!map[d]) map[d] = { date: d, income: 0, expenses: 0 }
-    const amt = Number(t.amount) || 0
+    const amt = toCents(t.amount)
     if (t.type === 'income') map[d].income += amt
     if (t.type === 'expense') map[d].expenses += amt
     if (t.type === 'refund') map[d].expenses -= amt
   }
-  return Object.values(map).map(r => ({ ...r, income: round2(r.income), expenses: round2(Math.max(0, r.expenses)), net: round2(r.income - r.expenses) }))
+  return Object.values(map).map(r => ({
+    date: r.date,
+    income: fromCents(r.income),
+    expenses: fromCents(Math.max(0, r.expenses)),
+    net: fromCents(r.income - r.expenses)
+  }))
 }
 
 export function expenseDistribution(userId, opts = {}) {
@@ -216,10 +237,10 @@ export function expenseDistribution(userId, opts = {}) {
       const c = cmap[key]
       map[key] = { categoryId: key, name: c?.name || 'Uncategorized', color: c?.color || '#667085', amount: 0 }
     }
-    const amt = Number(t.amount) || 0
+    const amt = toCents(t.amount)
     map[key].amount += t.type === 'refund' ? -amt : amt
   }
-  return Object.values(map).filter(x => x.amount > 0).sort((a, b) => b.amount - a.amount)
+  return Object.values(map).filter(x => x.amount > 0).map(x => ({ ...x, amount: fromCents(x.amount) })).sort((a, b) => b.amount - a.amount)
 }
 
 export function financialHealthScore(userId) {
@@ -343,12 +364,13 @@ export function financialHealthScore(userId) {
 }
 
 function lastNMonths(n) {
+  const { y, m } = maputoYmd()
   const out = []
-  const now = new Date()
   for (let i = n - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
-    const end = new Date(d.getFullYear(), d.getMonth() + 1, 0)
-    out.push({ from: isoDate(d), to: isoDate(end) })
+    let mm = m - i
+    let yy = y
+    while (mm <= 0) { mm += 12; yy -= 1 }
+    out.push({ from: `${yy}-${String(mm).padStart(2, '0')}-01`, to: monthEnd(yy, mm) })
   }
   return out
 }
@@ -367,16 +389,16 @@ export function budgetPerformance(userId, range) {
     else if (b.scope === 'business') sql += ' AND business_id IS NOT NULL'
     const txs = db.prepare(sql).all(...params)
     for (const t of txs) {
-      const amt = Number(t.amount) || 0
+      const amt = toCents(t.amount)
       spent += t.type === 'refund' ? -amt : amt
     }
     spent = Math.max(0, spent)
-    const remaining = round2(b.amount - spent)
-    const pct = b.amount > 0 ? (spent / b.amount) * 100 : 0
+    const remaining = fromCents(toCents(b.amount) - spent)
+    const pct = b.amount > 0 ? (spent / toCents(b.amount)) * 100 : 0
     let status = 'ok'
     if (pct >= 100) status = 'exceeded'
     else if (pct >= 80) status = 'warning'
-    return { ...b, spent: round2(spent), remaining, percent: round2(pct), status }
+    return { ...b, spent: fromCents(spent), remaining, percent: round2(pct), status }
   })
 }
 
@@ -518,10 +540,11 @@ export function coachInsights(userId) {
 }
 
 function previousMonth() {
-  const now = new Date()
-  const d = new Date(now.getFullYear(), now.getMonth() - 1, 1)
-  const end = new Date(now.getFullYear(), now.getMonth(), 0)
-  return { from: isoDate(d), to: isoDate(end) }
+  const { y, m } = maputoYmd()
+  let mm = m - 1
+  let yy = y
+  if (mm <= 0) { mm = 12; yy -= 1 }
+  return { from: `${yy}-${String(mm).padStart(2, '0')}-01`, to: monthEnd(yy, mm) }
 }
 
 export function affordability(userId, amount) {
@@ -601,14 +624,22 @@ export function businessSummary(userId, businessId, opts = {}) {
   const b = db.prepare('SELECT * FROM businesses WHERE id = ? AND user_id = ?').get(businessId, userId)
   if (!b) return null
   const stats = periodStats(userId, { ...opts, businessId })
-  const accounts = allAccountBalances(userId).filter(a => a.business_id === businessId)
-  const cash = round2(accounts.reduce((s, a) => s + a.balance, 0))
+  const accounts = allAccountBalances(userId).filter(a => sameId(a.business_id, businessId))
+  const linkedCash = fromCents(accounts.reduce((s, a) => s + toCents(a.balance), 0))
+  const allBizTx = txFilter(userId, { businessId })
+  let opCents = 0
+  for (const t of allBizTx) {
+    const amt = toCents(t.amount)
+    if (t.type === 'income' || t.type === 'owner_contribution' || t.type === 'refund') opCents += amt
+    if (t.type === 'expense' || t.type === 'owner_draw') opCents -= amt
+  }
+  const cash = accounts.length ? linkedCash : fromCents(opCents)
   const txs = txFilter(userId, { ...opts, businessId })
-  return { ...b, ...stats, cash, accounts, transactions: txs.slice(0, 20) }
+  return { ...b, ...stats, cash, linkedCash, operatingCash: fromCents(opCents), accounts, transactions: txs.slice(0, 20) }
 }
 
 export function round2(n) {
-  return Math.round((Number(n) || 0) * 100) / 100
+  return fromCents(toCents(n))
 }
 
 export function fmt(n, currency = 'MZN') {

@@ -23,7 +23,7 @@ export default function BusinessDetail({ user }) {
         <div className="card kpi"><div className="label">Revenue</div><div className="value pos">{money(b.businessRevenue, c)}</div></div>
         <div className="card kpi"><div className="label">Expenses</div><div className="value neg">{money(b.businessExpenses, c)}</div></div>
         <div className="card kpi"><div className="label">Profit</div><div className="value"><Money value={b.businessProfit} currency={c} signed /></div></div>
-        <div className="card kpi"><div className="label">Cash</div><div className="value">{money(b.cash, c)}</div></div>
+        <div className="card kpi"><div className="label">Cash</div><div className="value">{money(b.cash, c)}</div><div className="sub">{b.accounts?.length ? 'From linked accounts' : 'Operating cash from business transactions (no linked accounts)'}</div></div>
         <div className="card kpi"><div className="label">Owner draws</div><div className="value">{money(b.ownerDraws, c)}</div></div>
         <div className="card kpi"><div className="label">Owner contributions</div><div className="value">{money(b.ownerContributions, c)}</div></div>
       </div>

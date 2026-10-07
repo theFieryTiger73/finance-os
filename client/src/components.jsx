@@ -47,26 +47,37 @@ export function TxForm({ accounts, categories, businesses, debts, goals, initial
     toAccountId: initial?.to_account_id || '',
     categoryId: initial?.category_id || '',
     businessId: initial?.business_id || '',
-    debtId: initial?.debt_id || '',
+    debtId: initial?.debt_id || initial?.debtId || '',
     goalId: initial?.goal_id || '',
     description: initial?.description || '',
     notes: initial?.notes || '',
     tags: initial?.tags || '',
     file: null
   })
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
   const catType = form.type === 'income' || form.type === 'owner_contribution' ? 'income' : 'expense'
   const cats = categories.filter(c => c.status !== 'archived' && (form.type === 'transfer' || c.type === catType || form.type === 'adjustment' || form.type === 'investment' || form.type === 'refund'))
 
   async function submit(e) {
     e.preventDefault()
-    const fd = new FormData()
-    Object.entries(form).forEach(([k, v]) => {
-      if (k === 'file') return
-      if (v !== '' && v != null) fd.append(k, v)
-    })
-    if (form.file) fd.append('attachment', form.file)
-    await onSave(fd)
+    if (busy) return
+    setErr('')
+    setBusy(true)
+    try {
+      const fd = new FormData()
+      Object.entries(form).forEach(([k, v]) => {
+        if (k === 'file') return
+        if (v !== '' && v != null) fd.append(k, v)
+      })
+      if (form.file) fd.append('attachment', form.file)
+      await onSave(fd)
+    } catch (ex) {
+      setErr(ex.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
@@ -126,9 +137,10 @@ export function TxForm({ accounts, categories, businesses, debts, goals, initial
       <Field label="Notes"><textarea value={form.notes} onChange={e => set('notes', e.target.value)} /></Field>
       <Field label="Tags"><input value={form.tags} onChange={e => set('tags', e.target.value)} placeholder="comma,separated" /></Field>
       <Field label="Receipt / invoice"><input type="file" accept=".png,.jpg,.jpeg,.webp,.svg,.pdf,image/*,application/pdf" onChange={e => set('file', e.target.files[0])} /></Field>
+      {err && <div className="err">{err}</div>}
       <div className="row">
-        <button className="btn" type="submit">Save</button>
-        <button className="btn secondary" type="button" onClick={onCancel}>Cancel</button>
+        <button className="btn" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
+        <button className="btn secondary" type="button" onClick={onCancel} disabled={busy}>Cancel</button>
       </div>
     </form>
   )

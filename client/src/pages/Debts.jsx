@@ -7,6 +7,8 @@ export default function Debts({ user }) {
   const [sort, setSort] = useState('interest')
   const [form, setForm] = useState(null)
   const [pay, setPay] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const lookups = useLookups()
   const c = user.currency
 
@@ -15,9 +17,14 @@ export default function Debts({ user }) {
 
   async function save(e) {
     e.preventDefault()
-    if (form.id) await api(`/debts/${form.id}`, { method: 'PUT', body: form })
-    else await api('/debts', { method: 'POST', body: form })
-    setForm(null); load()
+    if (busy) return
+    setErr(''); setBusy(true)
+    try {
+      if (form.id) await api(`/debts/${form.id}`, { method: 'PUT', body: form })
+      else await api('/debts', { method: 'POST', body: form })
+      setForm(null); load()
+    } catch (ex) { setErr(ex.message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -57,7 +64,8 @@ export default function Debts({ user }) {
             <Field label="Priority"><select value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}><option>high</option><option>medium</option><option>low</option></select></Field>
             <Field label="Status"><select value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}><option>active</option><option>paid</option><option>overdue</option><option>archived</option></select></Field>
             <Field label="Notes"><textarea value={form.notes || ''} onChange={e => setForm({ ...form, notes: e.target.value })} /></Field>
-            <button className="btn">Save</button>
+            {err && <div className="err">{err}</div>}
+            <button className="btn" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </form>
         </Modal>
       )}

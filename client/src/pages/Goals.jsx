@@ -6,6 +6,8 @@ export default function Goals({ user }) {
   const [rows, setRows] = useState([])
   const [accounts, setAccounts] = useState([])
   const [form, setForm] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const c = user.currency
 
   async function load() {
@@ -16,9 +18,14 @@ export default function Goals({ user }) {
 
   async function save(e) {
     e.preventDefault()
-    if (form.id) await api(`/goals/${form.id}`, { method: 'PUT', body: form })
-    else await api('/goals', { method: 'POST', body: form })
-    setForm(null); load()
+    if (busy) return
+    setErr(''); setBusy(true)
+    try {
+      if (form.id) await api(`/goals/${form.id}`, { method: 'PUT', body: form })
+      else await api('/goals', { method: 'POST', body: form })
+      setForm(null); load()
+    } catch (ex) { setErr(ex.message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -57,7 +64,8 @@ export default function Goals({ user }) {
             </Field>
             <Field label="Priority"><select value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}><option>high</option><option>medium</option><option>low</option></select></Field>
             <Field label="Notes"><textarea value={form.notes || ''} onChange={e => setForm({ ...form, notes: e.target.value })} /></Field>
-            <button className="btn">Save</button>
+            {err && <div className="err">{err}</div>}
+            <button className="btn" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </form>
         </Modal>
       )}
