@@ -2,10 +2,12 @@ import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import {
   LayoutDashboard, ArrowLeftRight, Wallet, PieChart, Landmark, Target, Store,
-  BarChart3, MessageSquare, CalendarDays, Settings, Plus, Search, Menu, LogOut
+  BarChart3, MessageSquare, CalendarDays, Settings, Search, Menu, LogOut
 } from 'lucide-react'
 import { api, setToken } from './api.js'
-import { Modal, TxForm, useLookups } from './components.jsx'
+import { Modal, TxForm, RecurringForm, useLookups } from './components.jsx'
+import { isOnline, pendingCount, cacheClear } from './offline.js'
+import { flushQueue } from './sync.js'
 
 const NAV = [
   ['/', 'Dashboard', LayoutDashboard],
@@ -35,10 +37,13 @@ export default function Layout({ user, setUser }) {
   const [q, setQ] = useState('')
   const [results, setResults] = useState(null)
   const [txOpen, setTxOpen] = useState(false)
+  const [recOpen, setRecOpen] = useState(false)
   const [fabOpen, setFabOpen] = useState(false)
   const [preset, setPreset] = useState(null)
   const [notes, setNotes] = useState([])
   const [showNotes, setShowNotes] = useState(false)
+  const [online, setOnline] = useState(isOnline())
+  const [pending, setPending] = useState(0)
   const nav = useNavigate()
   const loc = useLocation()
   const lookups = useLookups()
@@ -47,6 +52,21 @@ export default function Layout({ user, setUser }) {
   useEffect(() => {
     api('/notifications').then(setNotes).catch(() => {})
   }, [loc.pathname])
+  useEffect(() => {
+    function refresh() {
+      setOnline(isOnline())
+      pendingCount().then(setPending).catch(() => setPending(0))
+    }
+    refresh()
+    window.addEventListener('online', refresh)
+    window.addEventListener('offline', refresh)
+    window.addEventListener('fos-offline', refresh)
+    return () => {
+      window.removeEventListener('online', refresh)
+      window.removeEventListener('offline', refresh)
+      window.removeEventListener('fos-offline', refresh)
+    }
+  }, [])
 
   async function search(v) {
     setQ(v)
@@ -64,6 +84,7 @@ export default function Layout({ user, setUser }) {
   function logout() {
     setToken(null)
     setUser(null)
+    cacheClear().catch(() => {})
     nav('/login')
   }
 
@@ -76,6 +97,7 @@ export default function Layout({ user, setUser }) {
 
   return (
     <div className="app">
+      {open && <div className="nav-backdrop" onClick={() => setOpen(false)} />}
       <aside className={`sidebar ${open ? 'open' : ''}`}>
         <div className="brand">
           <h1>{user.brandName}</h1>
@@ -94,6 +116,12 @@ export default function Layout({ user, setUser }) {
         </div>
       </aside>
       <div className="content">
+        {(!online || pending > 0) && (
+          <div className={`offline-banner ${online ? 'queued' : 'offline'}`}>
+            <span>{online ? `${pending} change${pending === 1 ? '' : 's'} waiting to sync` : pending ? `Offline · ${pending} queued` : 'Offline · new entries will sync later'}</span>
+            {online && pending > 0 && <button className="btn sm ghost" onClick={() => flushQueue()}>Sync now</button>}
+          </div>
+        )}
         <header className="topbar">
           <button className="btn ghost sm menu" onClick={() => setOpen(o => !o)}><Menu size={18} /></button>
           <div className="search">
@@ -135,11 +163,11 @@ export default function Layout({ user, setUser }) {
         )}
         <main className="page"><Outlet /></main>
         <nav className="mobile-nav">
-          <NavLink to="/" end>Home</NavLink>
-          <NavLink to="/transactions">Tx</NavLink>
-          <NavLink to="/accounts">Accounts</NavLink>
-          <NavLink to="/goals">Goals</NavLink>
-          <NavLink to="/settings">More</NavLink>
+          <NavLink to="/" end><LayoutDashboard size={18} /><span>Home</span></NavLink>
+          <NavLink to="/transactions"><ArrowLeftRight size={18} /><span>Tx</span></NavLink>
+          <NavLink to="/accounts"><Wallet size={18} /><span>Accounts</span></NavLink>
+          <NavLink to="/goals"><Target size={18} /><span>Goals</span></NavLink>
+          <NavLink to="/settings"><Settings size={18} /><span>More</span></NavLink>
         </nav>
       </div>
       <button className="fab" onClick={() => setFabOpen(f => !f)}>+</button>
@@ -148,11 +176,17 @@ export default function Layout({ user, setUser }) {
           {[['income', 'Income'], ['expense', 'Expense'], ['transfer', 'Transfer']].map(([t, l]) => (
             <button key={t} className="btn sm" onClick={() => { setPreset({ type: t }); setTxOpen(true); setFabOpen(false) }}>{l}</button>
           ))}
+          <button className="btn sm secondary" onClick={() => { setRecOpen(true); setFabOpen(false) }}>Recurring</button>
         </div>
       )}
       {txOpen && (
         <Modal title="Add Transaction" onClose={() => { setTxOpen(false); setPreset(null) }}>
           <TxForm {...lookups} initial={preset} onSave={saveTx} onCancel={() => { setTxOpen(false); setPreset(null) }} />
+        </Modal>
+      )}
+      {recOpen && (
+        <Modal title="Add recurring expense" onClose={() => setRecOpen(false)}>
+          <RecurringForm {...lookups} initial={{ type: 'expense', frequency: 'monthly' }} onSave={async body => { await api('/recurring', { method: 'POST', body }); setRecOpen(false); window.dispatchEvent(new Event('fos-refresh')) }} onCancel={() => setRecOpen(false)} />
         </Modal>
       )}
     </div>

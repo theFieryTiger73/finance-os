@@ -140,9 +140,9 @@ export default function Dashboard({ user }) {
         <div className="card">
           <h3>Recent transactions</h3>
           {d.recent.length ? d.recent.map(t => (
-            <div key={t.id} className="row" style={{ justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--line)' }}>
+            <div key={t.id} className="row" style={{ justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--line)', opacity: t._pending ? 0.7 : 1 }}>
               <div>
-                <div>{t.description || t.type}</div>
+                <div>{t.description || t.type}{t._pending ? ' · pending' : ''}</div>
                 <div className="sub">{t.date} · {t.type}</div>
               </div>
               <Money value={['expense', 'debt_payment', 'owner_draw', 'transfer'].includes(t.type) && t.type !== 'transfer' ? -t.amount : t.type === 'income' || t.type === 'refund' || t.type === 'owner_contribution' ? t.amount : t.amount} currency={c} signed />

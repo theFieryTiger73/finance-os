@@ -1,13 +1,20 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { api, money, initials } from '../api.js'
-import { Empty, Money } from '../components.jsx'
+import { Empty, Money, Modal, RecurringForm, RecurringList, useLookups } from '../components.jsx'
 
 export default function BusinessDetail({ user }) {
   const { id } = useParams()
   const [b, setB] = useState(null)
+  const [rec, setRec] = useState([])
+  const [form, setForm] = useState(null)
+  const lookups = useLookups()
   const c = user.currency
-  useEffect(() => { api(`/businesses/${id}`).then(setB) }, [id])
+  async function load() {
+    setB(await api(`/businesses/${id}`))
+    setRec(await api(`/recurring?businessId=${id}`))
+  }
+  useEffect(() => { load() }, [id])
   if (!b) return <p className="sub">Loading business…</p>
   return (
     <>
@@ -33,6 +40,20 @@ export default function BusinessDetail({ user }) {
           <div key={a.id} className="row" style={{ justifyContent: 'space-between' }}><span>{a.name}</span><span>{money(a.balance, c)}</span></div>
         )) : <Empty title="No accounts linked to this business yet." />}
       </div>
+      <RecurringList
+        rows={rec}
+        currency={c}
+        businesses={lookups.businesses}
+        onAdd={() => setForm({ type: 'expense', frequency: 'monthly', businessId: id })}
+        onConfirm={async r => { await api(`/recurring/${r.id}/confirm`, { method: 'POST', body: {} }); load(); window.dispatchEvent(new Event('fos-refresh')) }}
+        onPause={async r => { await api(`/recurring/${r.id}`, { method: 'PUT', body: { status: 'paused' } }); load() }}
+        onResume={async r => { await api(`/recurring/${r.id}`, { method: 'PUT', body: { status: 'active' } }); load() }}
+      />
+      {form && (
+        <Modal title={`Recurring expense · ${b.name}`} onClose={() => setForm(null)}>
+          <RecurringForm {...lookups} lockBusiness={id} initial={form} onSave={async body => { await api('/recurring', { method: 'POST', body: { ...body, businessId: id } }); setForm(null); load() }} onCancel={() => setForm(null)} />
+        </Modal>
+      )}
       <div className="card" style={{ marginTop: 14 }}>
         <h3>Transactions</h3>
         {b.transactions?.length ? b.transactions.map(t => (

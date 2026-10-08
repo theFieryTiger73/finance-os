@@ -14,6 +14,11 @@ export default function Debts({ user }) {
 
   async function load() { setRows(await api(`/debts?sort=${sort}`)) }
   useEffect(() => { load() }, [sort])
+  useEffect(() => {
+    const h = () => load()
+    window.addEventListener('fos-refresh', h)
+    return () => window.removeEventListener('fos-refresh', h)
+  }, [sort])
 
   async function save(e) {
     e.preventDefault()
@@ -39,17 +44,19 @@ export default function Debts({ user }) {
         ))}
       </div>
       {rows.length ? rows.map(d => (
-        <div key={d.id} className="card" style={{ marginBottom: 12 }}>
+        <div key={d.id} className={`card ${d._pending ? 'pending-row' : ''}`} style={{ marginBottom: 12 }}>
           <div className="row" style={{ justifyContent: 'space-between' }}>
-            <strong>{d.creditor}</strong>
-            <span className={`pill ${d.status === 'overdue' ? 'bad' : d.status === 'paid' ? 'ok' : 'info'}`}>{d.status}</span>
+            <strong>{d.creditor}{d._pending ? ' · pending' : ''}</strong>
+            <span className={`pill ${d.status === 'overdue' ? 'bad' : d.status === 'paid' ? 'ok' : 'info'}`}>{d.status || 'queued'}</span>
           </div>
           <p className="sub">Original {money(d.original_amount, c)} · Paid {money(d.paid, c)} · Remaining {money(d.remaining, c)} · {d.interest}% · due {d.due_date || '—'}</p>
           <Progress pct={d.percent} kind={d.status === 'paid' ? 'ok' : 'bad'} />
-          <div className="row" style={{ marginTop: 8 }}>
-            <button className="btn sm" onClick={() => setPay(d)}>Record payment</button>
-            <button className="btn sm secondary" onClick={() => setForm({ ...d, originalAmount: d.original_amount, currentBalance: d.current_balance, dueDate: d.due_date, minimumPayment: d.minimum_payment, accountId: d.account_id })}>Edit</button>
-          </div>
+          {!d._pending && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn sm" onClick={() => setPay(d)}>Record payment</button>
+              <button className="btn sm secondary" onClick={() => setForm({ ...d, originalAmount: d.original_amount, currentBalance: d.current_balance, dueDate: d.due_date, minimumPayment: d.minimum_payment, accountId: d.account_id })}>Edit</button>
+            </div>
+          )}
         </div>
       )) : <Empty title="No debts yet. Add a creditor only if you actually owe money." action="+ Add Debt" onAction={() => setForm({ creditor: '', originalAmount: '', interest: 0, status: 'active', priority: 'medium' })} />}
       {form && (

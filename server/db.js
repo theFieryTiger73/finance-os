@@ -10,9 +10,17 @@ fs.mkdirSync(dataDir, { recursive: true })
 fs.mkdirSync(path.join(uploadsDir, 'logos'), { recursive: true })
 fs.mkdirSync(path.join(uploadsDir, 'attachments'), { recursive: true })
 
-const db = new DatabaseSync(path.join(dataDir, 'finance.db'))
+const dbPath = path.join(dataDir, 'finance.db')
+const backupsDir = path.join(dataDir, 'backups')
+fs.mkdirSync(backupsDir, { recursive: true })
+
+const db = new DatabaseSync(dbPath)
 db.exec('PRAGMA journal_mode = WAL')
+db.exec('PRAGMA synchronous = FULL')
+db.exec('PRAGMA busy_timeout = 8000')
 db.exec('PRAGMA foreign_keys = ON')
+db.exec('PRAGMA wal_autocheckpoint = 500')
+db.exec('PRAGMA temp_store = MEMORY')
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -243,6 +251,18 @@ CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
 CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_user_date ON financial_snapshots(user_id, date);
 CREATE INDEX IF NOT EXISTS idx_attachments_user ON attachments(user_id);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  action TEXT NOT NULL,
+  entity TEXT NOT NULL,
+  entity_id INTEGER,
+  before_json TEXT DEFAULT '',
+  after_json TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, created_at);
 `)
 
 export function seedDefaultCategories(userId) {
@@ -282,15 +302,44 @@ export function seedDefaultCategories(userId) {
   }
 }
 
-try {
-  db.exec('ALTER TABLE debts ADD COLUMN opening_balance REAL')
-} catch { /* already exists */ }
+function addColumn(sql) {
+  try { db.exec(sql) } catch { /* already exists */ }
+}
+addColumn('ALTER TABLE debts ADD COLUMN opening_balance REAL')
+addColumn('ALTER TABLE transactions ADD COLUMN voided_at TEXT')
+addColumn("ALTER TABLE transactions ADD COLUMN void_reason TEXT DEFAULT ''")
+addColumn('ALTER TABLE transactions ADD COLUMN client_id TEXT')
+addColumn('ALTER TABLE accounts ADD COLUMN client_id TEXT')
+addColumn('ALTER TABLE businesses ADD COLUMN client_id TEXT')
+addColumn('ALTER TABLE debts ADD COLUMN client_id TEXT')
+addColumn('ALTER TABLE goals ADD COLUMN client_id TEXT')
+addColumn('ALTER TABLE budgets ADD COLUMN client_id TEXT')
+db.exec(`
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  user_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  entity TEXT,
+  entity_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_client ON transactions(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_client ON accounts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_biz_client ON businesses(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_debt_client ON debts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_client ON goals(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budget_client ON budgets(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+`)
+
+export const LIVE_TX = "COALESCE(voided_at,'') = ''"
 
 const debtsNeedOpening = db.prepare('SELECT id, original_amount, current_balance FROM debts WHERE opening_balance IS NULL').all()
 const setOpening = db.prepare('UPDATE debts SET opening_balance = ? WHERE id = ?')
 for (const d of debtsNeedOpening) {
-  const paid = db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE debt_id = ? AND type = 'debt_payment'").get(d.id).s
+  const paid = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(d.id).s
   setOpening.run(Number(d.current_balance) + Number(paid || 0), d.id)
 }
 
-export { db, dataDir, uploadsDir }
+export { db, dataDir, uploadsDir, backupsDir, dbPath }

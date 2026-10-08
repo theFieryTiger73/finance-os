@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api, setToken, COUNTRIES, CURRENCIES } from '../api.js'
 import { Empty, Field, Modal } from '../components.jsx'
+import { isOnline, queueAll, cacheClear } from '../offline.js'
+import { flushQueue } from '../sync.js'
 
 export default function Settings({ user, setUser }) {
   const [profile, setProfile] = useState({ ...user })
@@ -11,13 +13,39 @@ export default function Settings({ user, setUser }) {
   const [catForm, setCatForm] = useState(null)
   const [ruleForm, setRuleForm] = useState(null)
   const [accounts, setAccounts] = useState([])
+  const [backups, setBackups] = useState({ backups: [], integrity: 'ok' })
+  const [auditRows, setAuditRows] = useState([])
+  const [syncState, setSyncState] = useState({ online: isOnline(), pending: 0, failed: [] })
 
   async function load() {
     setCats(await api('/categories'))
     setRules(await api('/allocations'))
     setAccounts(await api('/accounts'))
+    try {
+      setBackups(await api('/data/backups'))
+      setAuditRows(await api('/audit'))
+    } catch { /* optional */ }
   }
   useEffect(() => { load() }, [])
+  useEffect(() => {
+    async function refresh() {
+      const rows = await queueAll().catch(() => [])
+      setSyncState({
+        online: isOnline(),
+        pending: rows.filter(r => r.status !== 'failed').length,
+        failed: rows.filter(r => r.status === 'failed')
+      })
+    }
+    refresh()
+    window.addEventListener('fos-offline', refresh)
+    window.addEventListener('online', refresh)
+    window.addEventListener('offline', refresh)
+    return () => {
+      window.removeEventListener('fos-offline', refresh)
+      window.removeEventListener('online', refresh)
+      window.removeEventListener('offline', refresh)
+    }
+  }, [])
 
   async function saveProfile(e) {
     e.preventDefault()
@@ -64,7 +92,7 @@ export default function Settings({ user, setUser }) {
           <Field label="Current password"><input type="password" value={pw.currentPassword} onChange={e => setPw({ ...pw, currentPassword: e.target.value })} /></Field>
           <Field label="New password"><input type="password" minLength={8} value={pw.newPassword} onChange={e => setPw({ ...pw, newPassword: e.target.value })} /></Field>
           <button className="btn">Update password</button>
-          <button type="button" className="btn ghost" onClick={() => { setToken(null); setUser(null) }}>Log out</button>
+          <button type="button" className="btn ghost" onClick={() => { setToken(null); setUser(null); cacheClear().catch(() => {}) }}>Log out</button>
         </form>
       </div>
       <div className="card" style={{ marginTop: 14 }}>
@@ -101,6 +129,65 @@ export default function Settings({ user, setUser }) {
           </div>
         ))}
         {!rules.length && <Empty title="No allocation rules yet. Create one only if you want income splitting." />}
+      </div>
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Offline sync</h3>
+        <p className="sub">{syncState.online ? 'Online' : 'Offline'}. {syncState.pending} change{syncState.pending === 1 ? '' : 's'} waiting to sync. Add transactions on your phone without signal; they upload when you reconnect.</p>
+        <div className="row">
+          <button className="btn sm" disabled={!syncState.online || !syncState.pending} onClick={async () => { await flushQueue(); setMsg('Sync attempted.') }}>Sync now</button>
+        </div>
+        {syncState.failed.length ? (
+          <div style={{ marginTop: 10 }}>
+            {syncState.failed.map(f => (
+              <div key={f.id} className="sub">{f.method} {f.path} · {f.lastError || 'failed'}</div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Your data</h3>
+        <p className="sub">Transactions are never erased. Voiding keeps a restoreable history. Daily snapshots are stored on this server. Download a JSON copy for yourself.</p>
+        <p className="sub">Database integrity: {backups.integrity}</p>
+        <div className="row">
+          <button className="btn sm" onClick={async () => {
+            const data = await api('/data/export')
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+            const a = document.createElement('a')
+            a.href = URL.createObjectURL(blob)
+            a.download = `finance-os-${new Date().toISOString().slice(0, 10)}.json`
+            a.click()
+            setMsg('Export downloaded.')
+          }}>Download backup JSON</button>
+          <button className="btn sm secondary" onClick={async () => {
+            const r = await api('/data/backup', { method: 'POST', body: {} })
+            setMsg(`Snapshot saved: ${r.file}`)
+            setBackups(await api('/data/backups'))
+          }}>Save server snapshot</button>
+          <label className="btn sm secondary">
+            Restore JSON
+            <input type="file" accept="application/json,.json" style={{ display: 'none' }} onChange={async e => {
+              const file = e.target.files?.[0]
+              if (!file) return
+              try {
+                const payload = JSON.parse(await file.text())
+                await api('/data/restore', { method: 'POST', body: payload })
+                setMsg('Restore completed. Missing records were added; existing records were kept.')
+                load()
+              } catch (ex) { setMsg(ex.message) }
+            }} />
+          </label>
+        </div>
+        {backups.backups?.length ? (
+          <p className="sub" style={{ marginTop: 10 }}>{backups.backups.length} server snapshot{backups.backups.length === 1 ? '' : 's'} retained (latest {backups.backups[0].createdAt}).</p>
+        ) : <p className="sub">No snapshots yet. One is created automatically each day and on shutdown.</p>}
+        {auditRows.length ? (
+          <div style={{ marginTop: 12 }}>
+            <h3>Recent activity log</h3>
+            {auditRows.slice(0, 12).map(r => (
+              <div key={r.id} className="sub">{r.created_at} · {r.action} {r.entity} {r.entity_id || ''}</div>
+            ))}
+          </div>
+        ) : null}
       </div>
       {catForm && (
         <Modal title={catForm.id ? 'Edit category' : 'Add category'} onClose={() => setCatForm(null)}>

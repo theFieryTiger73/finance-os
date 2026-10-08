@@ -15,6 +15,11 @@ export default function Goals({ user }) {
     setAccounts(await api('/accounts'))
   }
   useEffect(() => { load() }, [])
+  useEffect(() => {
+    const h = () => load()
+    window.addEventListener('fos-refresh', h)
+    return () => window.removeEventListener('fos-refresh', h)
+  }, [])
 
   async function save(e) {
     e.preventDefault()
@@ -37,14 +42,14 @@ export default function Goals({ user }) {
       {rows.length ? (
         <div className="grid cards-2">
           {rows.map(g => (
-            <div key={g.id} className="card">
+            <div key={g.id} className={`card ${g._pending ? 'pending-row' : ''}`}>
               <div className="row" style={{ justifyContent: 'space-between' }}>
-                <strong>{g.name}</strong>
+                <strong>{g.name}{g._pending ? ' · pending' : ''}</strong>
                 <span className="pill goal">{g.priority}</span>
               </div>
               <p className="sub">{money(g.current, c)} of {money(g.target_amount, c)} · {money(g.remaining, c)} remaining · {g.target_date || 'no date'}</p>
               <Progress pct={g.percent} kind="goal" />
-              <button className="btn ghost sm" onClick={() => setForm({ ...g, targetAmount: g.target_amount, currentAmount: g.current_amount, targetDate: g.target_date, accountId: g.account_id })}>Edit</button>
+              {!g._pending && <button className="btn ghost sm" onClick={() => setForm({ ...g, targetAmount: g.target_amount, currentAmount: g.current_amount, targetDate: g.target_date, accountId: g.account_id })}>Edit</button>}
             </div>
           ))}
         </div>

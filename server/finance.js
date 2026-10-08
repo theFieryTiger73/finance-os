@@ -1,4 +1,4 @@
-import { db } from './db.js'
+import { db, LIVE_TX } from './db.js'
 import { toCents, fromCents, sameId, isoDate as maputoDate } from './money.js'
 
 export const ACCOUNT_TYPES = [
@@ -40,7 +40,7 @@ export function periodRange(period, customFrom, customTo) {
 export function accountBalance(userId, accountId) {
   const acc = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(accountId, userId)
   if (!acc) return 0
-  const txs = db.prepare('SELECT * FROM transactions WHERE user_id = ? AND (account_id = ? OR to_account_id = ?)').all(userId, accountId, accountId)
+  const txs = db.prepare(`SELECT * FROM transactions WHERE user_id = ? AND (account_id = ? OR to_account_id = ?) AND ${LIVE_TX}`).all(userId, accountId, accountId)
   let cents = toCents(acc.initial_balance)
   for (const t of txs) cents += effectOnAccountCents(t, accountId)
   return fromCents(cents)
@@ -83,7 +83,7 @@ export function debtBalance(userId, debtId) {
   const d = db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
   if (!d) return 0
   const opening = d.opening_balance != null ? d.opening_balance : d.original_amount
-  const paid = db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND debt_id = ? AND type = 'debt_payment'").get(userId, debtId).s
+  const paid = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(userId, debtId).s
   return fromCents(Math.max(0, toCents(opening) - toCents(paid)))
 }
 
@@ -161,7 +161,7 @@ export function recordSnapshot(userId) {
 }
 
 function txFilter(userId, { from, to, scope, businessId }) {
-  let sql = 'SELECT * FROM transactions WHERE user_id = ?'
+  let sql = `SELECT * FROM transactions WHERE user_id = ? AND ${LIVE_TX}`
   const params = [userId]
   if (from) { sql += ' AND date >= ?'; params.push(from) }
   if (to) { sql += ' AND date <= ?'; params.push(to) }
@@ -379,7 +379,7 @@ export function budgetPerformance(userId, range) {
   const budgets = db.prepare("SELECT * FROM budgets WHERE user_id = ? AND status = 'active'").all(userId)
   return budgets.map(b => {
     let spent = 0
-    let sql = "SELECT * FROM transactions WHERE user_id = ? AND type IN ('expense','refund')"
+    let sql = `SELECT * FROM transactions WHERE user_id = ? AND type IN ('expense','refund') AND ${LIVE_TX}`
     const params = [userId]
     if (range?.from) { sql += ' AND date >= ?'; params.push(range.from) }
     if (range?.to) { sql += ' AND date <= ?'; params.push(range.to) }
@@ -417,7 +417,7 @@ export function nextAction(userId) {
   if (accounts.length === 0) {
     return { severity: 'info', title: 'Add your first account', body: 'No accounts yet. Add your first account to start tracking cash, banks and wallets.' }
   }
-  const txCount = db.prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?').get(userId).c
+  const txCount = db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId).c
   if (txCount === 0) {
     return { severity: 'info', title: 'Record a transaction', body: 'Accounts are ready. Add income or an expense so Finance OS can calculate cash flow.' }
   }
@@ -532,7 +532,7 @@ export function coachInsights(userId) {
   }
 
   if (!insights.length) {
-    const txCount = db.prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?').get(userId).c
+    const txCount = db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId).c
     if (!txCount) insights.push({ type: 'info', text: 'No transactions yet. Insights appear after you record real activity.' })
     else insights.push({ type: 'info', text: 'Not enough period-over-period change to flag. Keep recording transactions.' })
   }

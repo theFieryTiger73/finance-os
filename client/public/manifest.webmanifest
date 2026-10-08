@@ -1,0 +1,14 @@
+{
+  "name": "Finance OS",
+  "short_name": "Finance OS",
+  "description": "Your money. Your businesses. One system.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1b33",
+  "theme_color": "#0b1b33",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

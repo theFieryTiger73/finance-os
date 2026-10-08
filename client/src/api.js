@@ -1,3 +1,8 @@
+import {
+  cacheGet, cachePut, queueAdd, newClientId, isOnline, isNetworkError,
+  formToPayload, canQueue, mergePending, optimisticFrom
+} from './offline.js'
+
 const TOKEN_KEY = 'financeos_token'
 
 export function getToken() { return localStorage.getItem(TOKEN_KEY) }
@@ -11,19 +16,66 @@ export function setToken(t) {
   }
 }
 
-export async function api(path, { method = 'GET', body, form } = {}) {
+async function rawFetch(path, { method = 'GET', body, form, clientId } = {}) {
   const headers = { Authorization: getToken() ? `Bearer ${getToken()}` : '' }
+  if (clientId) headers['Idempotency-Key'] = clientId
   let payload
   if (form) {
     payload = form
+    if (clientId && !payload.get('clientId')) payload.append('clientId', clientId)
   } else if (body !== undefined) {
     headers['Content-Type'] = 'application/json'
-    payload = JSON.stringify(body)
+    payload = JSON.stringify(clientId ? { ...body, clientId } : body)
   }
   const res = await fetch(`/api${path}`, { method, headers, body: payload })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error || 'Request failed')
+  if (!res.ok) {
+    const err = new Error(data.error || 'Request failed')
+    err.status = res.status
+    throw err
+  }
   return data
+}
+
+export async function api(path, { method = 'GET', body, form } = {}) {
+  const m = (method || 'GET').toUpperCase()
+  if (m === 'GET') {
+    try {
+      const data = await rawFetch(path, { method: m })
+      cachePut(path, data).catch(() => {})
+      return mergePending(path, data)
+    } catch (e) {
+      if (isNetworkError(e) || !isOnline()) {
+        const cached = await cacheGet(path)
+        if (cached !== undefined) return mergePending(path, cached)
+      }
+      throw e
+    }
+  }
+  const clientId = newClientId()
+  try {
+    return await rawFetch(path, { method: m, body, form, clientId })
+  } catch (e) {
+    if (canQueue(path, m) && (isNetworkError(e) || !isOnline())) {
+      const formObj = form ? await formToPayload(form) : null
+      const item = {
+        id: clientId,
+        clientId,
+        path,
+        method: m,
+        body: form ? undefined : (body || {}),
+        form: formObj,
+        optimistic: optimisticFrom(path, m, body, formObj, clientId),
+        createdAt: Date.now(),
+        tries: 0,
+        status: 'queued'
+      }
+      await queueAdd(item)
+      window.dispatchEvent(new Event('fos-refresh'))
+      return item.optimistic || { ok: true, queued: true, clientId }
+    }
+    throw e
+  }
 }
 
 export const money = (n, currency = 'MZN') => {

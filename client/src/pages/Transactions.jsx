@@ -8,6 +8,7 @@ export default function Transactions({ user }) {
   const [type, setType] = useState('')
   const [editing, setEditing] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [showVoided, setShowVoided] = useState(false)
   const lookups = useLookups()
   const c = user.currency
   const accName = id => lookups.accounts.find(a => Number(a.id) === Number(id))?.name || '—'
@@ -17,14 +18,15 @@ export default function Transactions({ user }) {
     const p = new URLSearchParams()
     if (q) p.set('q', q)
     if (type) p.set('type', type)
+    if (showVoided) p.set('includeVoided', '1')
     setRows(await api(`/transactions?${p}`))
   }
-  useEffect(() => { load() }, [q, type])
+  useEffect(() => { load() }, [q, type, showVoided])
   useEffect(() => {
     const h = () => load()
     window.addEventListener('fos-refresh', h)
     return () => window.removeEventListener('fos-refresh', h)
-  }, [q, type])
+  }, [q, type, showVoided])
 
   async function save(form) {
     if (editing) await api(`/transactions/${editing.id}`, { method: 'PUT', form })
@@ -42,6 +44,7 @@ export default function Transactions({ user }) {
         <input className="chip" placeholder="Search" value={q} onChange={e => setQ(e.target.value)} />
         <button className={`chip ${!type ? 'active' : ''}`} onClick={() => setType('')}>All</button>
         {TX_TYPES.map(([v, l]) => <button key={v} className={`chip ${type === v ? 'active' : ''}`} onClick={() => setType(v)}>{l}</button>)}
+        <button className={`chip ${showVoided ? 'active' : ''}`} onClick={() => setShowVoided(v => !v)}>Show voided</button>
       </div>
       <div className="card table-wrap">
         {rows.length ? (
@@ -49,17 +52,18 @@ export default function Transactions({ user }) {
             <thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Account</th><th>Category</th><th>Amount</th><th></th></tr></thead>
             <tbody>
               {rows.map(t => (
-                <tr key={t.id}>
+                <tr key={t.id} style={t.voided_at ? { opacity: 0.55 } : undefined} className={t._pending ? 'pending-row' : undefined}>
                   <td>{t.date}</td>
-                  <td>{t.type}</td>
+                  <td>{t.type}{t.voided_at ? ' · voided' : ''}{t._pending ? ' · pending' : ''}</td>
                   <td>{t.description || '—'}{t.attachment ? ' · file' : ''}</td>
                   <td>{accName(t.account_id)}{t.to_account_id ? ` → ${accName(t.to_account_id)}` : ''}</td>
                   <td>{catName(t.category_id)}</td>
                   <td className={t.type === 'income' || t.type === 'refund' || t.type === 'owner_contribution' ? 'pos' : t.type === 'transfer' ? '' : 'neg'}>{money(t.amount, c)}</td>
                   <td className="row">
-                    <button className="btn ghost sm" onClick={() => setEditing(t)}>Edit</button>
-                    <button className="btn ghost sm" onClick={async () => { await api(`/transactions/${t.id}/duplicate`, { method: 'POST', body: {} }); load() }}>Duplicate</button>
-                    <button className="btn ghost sm" onClick={async () => { if (confirm('Delete this transaction?')) { await api(`/transactions/${t.id}`, { method: 'DELETE' }); load() } }}>Delete</button>
+                    {!t._pending && !t.voided_at && <button className="btn ghost sm" onClick={() => setEditing(t)}>Edit</button>}
+                    {!t._pending && !t.voided_at && <button className="btn ghost sm" onClick={async () => { await api(`/transactions/${t.id}/duplicate`, { method: 'POST', body: {} }); load() }}>Duplicate</button>}
+                    {!t._pending && !t.voided_at && <button className="btn ghost sm" onClick={async () => { if (confirm('Void this transaction? It stays in history and can be restored.')) { await api(`/transactions/${t.id}`, { method: 'DELETE', body: { reason: 'voided by user' } }); load(); window.dispatchEvent(new Event('fos-refresh')) } }}>Void</button>}
+                    {!t._pending && t.voided_at && <button className="btn ghost sm" onClick={async () => { await api(`/transactions/${t.id}/restore`, { method: 'POST', body: {} }); load(); window.dispatchEvent(new Event('fos-refresh')) }}>Restore</button>}
                   </td>
                 </tr>
               ))}

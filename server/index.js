@@ -5,7 +5,8 @@ import crypto from 'crypto'
 import multer from 'multer'
 import { fileURLToPath } from 'url'
 import bcrypt from 'bcryptjs'
-import { db, uploadsDir } from './db.js'
+import { db, uploadsDir, LIVE_TX } from './db.js'
+import { audit, backupNow, maybeAutoBackup, listBackups, exportUser, restoreUser, integrityOk } from './persist.js'
 import { authMiddleware, publicUser, register, login, signToken, createResetToken, resetPassword } from './auth.js'
 import {
   accountBalance, allAccountBalances, syncDebtBalance, syncAllDebts, debtBalance, netWorth, recordSnapshot,
@@ -56,6 +57,29 @@ function emptyToNull(v) {
   return v
 }
 
+function clientKey(req) {
+  return String(req.headers['idempotency-key'] || req.body?.clientId || '').trim().slice(0, 80) || null
+}
+
+function replayIdempotent(req, table) {
+  const key = clientKey(req)
+  if (!key) return null
+  const hit = db.prepare('SELECT * FROM idempotency_keys WHERE user_id=? AND key=?').get(req.user.id, key)
+  if (hit?.entity_id) return own(hit.entity || table, req.user.id, hit.entity_id)
+  try {
+    return db.prepare(`SELECT * FROM ${table} WHERE user_id=? AND client_id=?`).get(req.user.id, key) || null
+  } catch {
+    return null
+  }
+}
+
+function rememberIdempotent(req, table, id) {
+  const key = clientKey(req)
+  if (!key || !id) return
+  db.prepare('INSERT OR IGNORE INTO idempotency_keys (user_id, key, method, path, entity, entity_id) VALUES (?,?,?,?,?,?)')
+    .run(req.user.id, key, req.method, req.originalUrl || req.path, table, id)
+}
+
 function refreshNotifications(userId) {
   syncAllDebts(userId)
   const today = isoDate()
@@ -81,8 +105,9 @@ function refreshNotifications(userId) {
 }
 
 async function start() {
+    maybeAutoBackup()
     const app = express()
-    app.use(express.json({ limit: '2mb' }))
+    app.use(express.json({ limit: '8mb' }))
 
   const api = express.Router()
 
@@ -161,19 +186,26 @@ async function start() {
 
   api.post('/accounts', (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'accounts')
+      if (existing) return res.json({ ...existing, balance: accountBalance(req.user.id, existing.id) })
       const { name, type, provider, currency, initialBalance, icon, color, notes, status, businessId } = req.body
       if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and type are required' })
       if (!ACCOUNT_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid account type' })
       const biz = emptyToNull(businessId)
       if (biz && !own('businesses', req.user.id, biz)) return res.status(400).json({ error: 'Business not found' })
       const initial = parseMoney(initialBalance ?? 0, { allowZero: true, allowNegative: type === 'credit_card', field: 'Initial balance' })
-      const info = db.prepare(`INSERT INTO accounts (user_id, name, type, provider, currency, initial_balance, icon, color, notes, status, business_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, String(name).trim(), type, provider || '', currency || req.user.currency, initial, icon || 'wallet', color || '#2E90FA', notes || '', status === 'archived' ? 'archived' : 'active', asId(biz))
+      const info = db.prepare(`INSERT INTO accounts (user_id, name, type, provider, currency, initial_balance, icon, color, notes, status, business_id, client_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), type, provider || '', currency || req.user.currency, initial, icon || 'wallet', color || '#2E90FA', notes || '', status === 'archived' ? 'archived' : 'active', asId(biz), clientKey(req))
       recordSnapshot(req.user.id)
       const a = own('accounts', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'accounts', a.id)
       res.json({ ...a, balance: accountBalance(req.user.id, a.id) })
-    } catch (e) { res.status(400).json({ error: e.message }) }
+    } catch (e) {
+      const replay = replayIdempotent(req, 'accounts')
+      if (replay) return res.json({ ...replay, balance: accountBalance(req.user.id, replay.id) })
+      res.status(400).json({ error: e.message })
+    }
   })
 
   api.put('/accounts/:id', (req, res) => {
@@ -204,7 +236,7 @@ async function start() {
   api.get('/accounts/:id/transactions', (req, res) => {
     const a = own('accounts', req.user.id, req.params.id)
     if (!a) return res.status(404).json({ error: 'Account not found' })
-    const rows = db.prepare('SELECT * FROM transactions WHERE user_id=? AND (account_id=? OR to_account_id=?) ORDER BY date DESC, id DESC').all(req.user.id, a.id, a.id)
+    const rows = db.prepare(`SELECT * FROM transactions WHERE user_id=? AND (account_id=? OR to_account_id=?) AND ${LIVE_TX} ORDER BY date DESC, id DESC`).all(req.user.id, a.id, a.id)
     res.json({ account: { ...a, balance: accountBalance(req.user.id, a.id) }, transactions: rows })
   })
 
@@ -219,13 +251,17 @@ async function start() {
   })
 
   api.post('/businesses', uploadLogo.single('logo'), (req, res) => {
+    const existing = replayIdempotent(req, 'businesses')
+    if (existing) return res.json(existing)
     const { name, description, type, brandColor, currency, status, notes } = req.body
     if (!name) return res.status(400).json({ error: 'Name is required' })
     const logo = req.file ? `/api/files/logos/${req.file.filename}` : ''
-    const info = db.prepare(`INSERT INTO businesses (user_id, name, logo, description, type, brand_color, currency, status, notes)
-      VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, name, logo, description || '', type || 'other', brandColor || '#7A5AF8', currency || req.user.currency, status || 'active', notes || '')
-    res.json(own('businesses', req.user.id, info.lastInsertRowid))
+    const info = db.prepare(`INSERT INTO businesses (user_id, name, logo, description, type, brand_color, currency, status, notes, client_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(req.user.id, name, logo, description || '', type || 'other', brandColor || '#7A5AF8', currency || req.user.currency, status || 'active', notes || '', clientKey(req))
+    const created = own('businesses', req.user.id, info.lastInsertRowid)
+    rememberIdempotent(req, 'businesses', created.id)
+    res.json(created)
   })
 
   api.put('/businesses/:id', uploadLogo.single('logo'), (req, res) => {
@@ -310,7 +346,7 @@ async function start() {
 
   api.get('/transactions', (req, res) => {
     const { q, type, accountId, businessId, categoryId, from, to, sort } = req.query
-    let sql = 'SELECT * FROM transactions WHERE user_id=?'
+    let sql = `SELECT * FROM transactions WHERE user_id=? AND ${req.query.includeVoided === '1' ? '1=1' : LIVE_TX}`
     const params = [req.user.id]
     if (type) { sql += ' AND type=?'; params.push(type) }
     if (accountId) { sql += ' AND (account_id=? OR to_account_id=?)'; params.push(accountId, accountId) }
@@ -326,12 +362,15 @@ async function start() {
 
   api.post('/transactions', uploadAttach.single('attachment'), (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'transactions')
+      if (existing) return res.json(existing)
       const b = req.body
       const v = validateTx(b, req.user.id)
       const attachment = req.file ? `/api/files/attachments/${req.file.filename}` : ''
-      const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, goal_id, description, notes, tags, attachment, recurring_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, v.amount, b.date, b.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, v.goalId, b.description || '', b.notes || '', parseTags(b.tags), attachment, asId(emptyToNull(b.recurringId)))
+      const cid = clientKey(req)
+      const info = db.prepare(`INSERT INTO transactions (user_id, amount, date, type, account_id, to_account_id, category_id, business_id, debt_id, goal_id, description, notes, tags, attachment, recurring_id, client_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, v.amount, b.date, b.type, v.accountId, v.toAccountId, v.categoryId, v.businessId, v.debtId, v.goalId, b.description || '', b.notes || '', parseTags(b.tags), attachment, asId(emptyToNull(b.recurringId)), cid)
       if (req.file) {
         db.prepare('INSERT INTO attachments (user_id, transaction_id, filename, path, mime) VALUES (?,?,?,?,?)')
           .run(req.user.id, info.lastInsertRowid, req.file.filename, attachment, req.file.mimetype || '')
@@ -339,14 +378,22 @@ async function start() {
       if (v.debtId) syncDebtBalance(req.user.id, v.debtId)
       applyGoalDelta(req.user.id, v.goalId, b.type, v.amount)
       recordSnapshot(req.user.id)
-      res.json(own('transactions', req.user.id, info.lastInsertRowid))
-    } catch (e) { res.status(400).json({ error: e.message }) }
+      const created = own('transactions', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'transactions', created.id)
+      audit(req.user.id, 'create', 'transaction', created.id, null, created)
+      res.json(created)
+    } catch (e) {
+      const replay = replayIdempotent(req, 'transactions')
+      if (replay) return res.json(replay)
+      res.status(400).json({ error: e.message })
+    }
   })
 
   api.put('/transactions/:id', uploadAttach.single('attachment'), (req, res) => {
     try {
       const t = own('transactions', req.user.id, req.params.id)
       if (!t) return res.status(404).json({ error: 'Transaction not found' })
+      if (t.voided_at) return res.status(400).json({ error: 'Restore this transaction before editing' })
       const b = req.body
       const merged = {
         type: b.type ?? t.type,
@@ -379,17 +426,41 @@ async function start() {
   api.delete('/transactions/:id', (req, res) => {
     const t = own('transactions', req.user.id, req.params.id)
     if (!t) return res.status(404).json({ error: 'Transaction not found' })
-    db.prepare('DELETE FROM transactions WHERE id=? AND user_id=?').run(t.id, req.user.id)
+    if (t.voided_at) return res.json({ ok: true, alreadyVoided: true })
+    db.prepare("UPDATE transactions SET voided_at=datetime('now'), void_reason=?, updated_at=datetime('now') WHERE id=? AND user_id=?")
+      .run(String(req.body?.reason || 'voided by user').slice(0, 200), t.id, req.user.id)
     if (t.debt_id) syncDebtBalance(req.user.id, t.debt_id)
     applyGoalDelta(req.user.id, t.goal_id, t.type, -Number(t.amount))
     recordSnapshot(req.user.id)
-    res.json({ ok: true })
+    audit(req.user.id, 'void', 'transaction', t.id, t, { reason: req.body?.reason || 'voided by user' })
+    res.json({ ok: true, voided: true })
+  })
+
+  api.post('/transactions/:id/restore', (req, res) => {
+    const t = own('transactions', req.user.id, req.params.id)
+    if (!t) return res.status(404).json({ error: 'Transaction not found' })
+    if (!t.voided_at) return res.json(t)
+    try {
+      validateTx({
+        type: t.type, amount: t.amount, date: t.date,
+        accountId: t.account_id, toAccountId: t.to_account_id, businessId: t.business_id,
+        debtId: t.debt_id, goalId: t.goal_id, categoryId: t.category_id
+      }, req.user.id)
+    } catch (e) { return res.status(400).json({ error: e.message }) }
+    db.prepare("UPDATE transactions SET voided_at=NULL, void_reason='', updated_at=datetime('now') WHERE id=? AND user_id=?").run(t.id, req.user.id)
+    if (t.debt_id) syncDebtBalance(req.user.id, t.debt_id)
+    applyGoalDelta(req.user.id, t.goal_id, t.type, Number(t.amount))
+    recordSnapshot(req.user.id)
+    const restored = own('transactions', req.user.id, t.id)
+    audit(req.user.id, 'restore', 'transaction', t.id, t, restored)
+    res.json(restored)
   })
 
   api.post('/transactions/:id/duplicate', (req, res) => {
     try {
       const t = own('transactions', req.user.id, req.params.id)
       if (!t) return res.status(404).json({ error: 'Transaction not found' })
+      if (t.voided_at) return res.status(400).json({ error: 'Cannot duplicate a voided transaction' })
       const date = isIsoDate(req.body?.date) ? req.body.date : isoDate()
       const v = validateTx({
         type: t.type, amount: t.amount, date,
@@ -413,13 +484,17 @@ async function start() {
 
   api.post('/budgets', (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'budgets')
+      if (existing) return res.json(existing)
       const { name, scope, businessId, categoryId, amount, period, startDate, endDate } = req.body
       if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and amount are required' })
       const amt = parseMoney(amount, { field: 'Amount' })
-      const info = db.prepare(`INSERT INTO budgets (user_id, name, scope, business_id, category_id, amount, period, start_date, end_date)
-        VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, String(name).trim(), scope || 'overall', asId(emptyToNull(businessId)), asId(emptyToNull(categoryId)), amt, period || 'monthly', startDate || null, endDate || null)
-      res.json(own('budgets', req.user.id, info.lastInsertRowid))
+      const info = db.prepare(`INSERT INTO budgets (user_id, name, scope, business_id, category_id, amount, period, start_date, end_date, client_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), scope || 'overall', asId(emptyToNull(businessId)), asId(emptyToNull(categoryId)), amt, period || 'monthly', startDate || null, endDate || null, clientKey(req))
+      const created = own('budgets', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'budgets', created.id)
+      res.json(created)
     } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
@@ -452,6 +527,8 @@ async function start() {
 
   api.post('/debts', (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'debts')
+      if (existing) return res.json(existing)
       const { creditor, originalAmount, currentBalance, interest, dueDate, minimumPayment, priority, notes, status, accountId } = req.body
       if (!creditor || !String(creditor).trim()) return res.status(400).json({ error: 'Creditor and original amount are required' })
       const orig = parseMoney(originalAmount, { field: 'Original amount' })
@@ -459,12 +536,14 @@ async function start() {
       if (opening > orig) throw new Error('Current balance cannot exceed original amount')
       const acc = emptyToNull(accountId)
       if (acc && !own('accounts', req.user.id, acc)) throw new Error('Account not found')
-      const info = db.prepare(`INSERT INTO debts (user_id, creditor, original_amount, current_balance, opening_balance, interest, due_date, minimum_payment, priority, notes, status, account_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, String(creditor).trim(), orig, opening, opening, Number(interest) || 0, dueDate || null, parseMoney(minimumPayment ?? 0, { allowZero: true, field: 'Minimum payment' }), priority || 'medium', notes || '', status || 'active', asId(acc))
+      const info = db.prepare(`INSERT INTO debts (user_id, creditor, original_amount, current_balance, opening_balance, interest, due_date, minimum_payment, priority, notes, status, account_id, client_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(creditor).trim(), orig, opening, opening, Number(interest) || 0, dueDate || null, parseMoney(minimumPayment ?? 0, { allowZero: true, field: 'Minimum payment' }), priority || 'medium', notes || '', status || 'active', asId(acc), clientKey(req))
       syncDebtBalance(req.user.id, info.lastInsertRowid)
       recordSnapshot(req.user.id)
-      res.json(own('debts', req.user.id, info.lastInsertRowid))
+      const created = own('debts', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'debts', created.id)
+      res.json(created)
     } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
@@ -496,16 +575,20 @@ async function start() {
 
   api.post('/goals', (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'goals')
+      if (existing) return res.json(existing)
       const { name, targetAmount, currentAmount, targetDate, priority, accountId, notes } = req.body
       if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name and target amount are required' })
       const target = parseMoney(targetAmount, { field: 'Target amount' })
       const current = parseMoney(currentAmount ?? 0, { allowZero: true, field: 'Current amount' })
       const acc = emptyToNull(accountId)
       if (acc && !own('accounts', req.user.id, acc)) throw new Error('Account not found')
-      const info = db.prepare(`INSERT INTO goals (user_id, name, target_amount, current_amount, target_date, priority, account_id, notes)
-        VALUES (?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, String(name).trim(), target, current, targetDate || null, priority || 'medium', asId(acc), notes || '')
-      res.json(own('goals', req.user.id, info.lastInsertRowid))
+      const info = db.prepare(`INSERT INTO goals (user_id, name, target_amount, current_amount, target_date, priority, account_id, notes, client_id)
+        VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.id, String(name).trim(), target, current, targetDate || null, priority || 'medium', asId(acc), notes || '', clientKey(req))
+      const created = own('goals', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'goals', created.id)
+      res.json(created)
     } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
@@ -519,20 +602,34 @@ async function start() {
   })
 
   api.get('/recurring', (req, res) => {
-    res.json(db.prepare('SELECT * FROM recurring_transactions WHERE user_id=? ORDER BY next_date').all(req.user.id))
+    let sql = 'SELECT * FROM recurring_transactions WHERE user_id=?'
+    const params = [req.user.id]
+    if (req.query.businessId === 'personal') sql += ' AND business_id IS NULL'
+    else if (req.query.businessId) { sql += ' AND business_id=?'; params.push(asId(req.query.businessId)) }
+    if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type) }
+    sql += ' ORDER BY next_date'
+    res.json(db.prepare(sql).all(...params))
   })
 
   api.post('/recurring', (req, res) => {
     try {
+      const existing = replayIdempotent(req, 'recurring_transactions')
+      if (existing) return res.json(existing)
       const { amount, frequency, startDate, endDate, accountId, toAccountId, categoryId, businessId, debtId, type, description } = req.body
       if (!frequency || !isIsoDate(startDate) || !type || !TX_TYPES.includes(type)) return res.status(400).json({ error: 'Amount, frequency, start date and type are required' })
       const amt = parseMoney(amount, { field: 'Amount' })
       if (accountId && !own('accounts', req.user.id, accountId)) throw new Error('Account not found')
       if (toAccountId && !own('accounts', req.user.id, toAccountId)) throw new Error('Account not found')
+      const biz = emptyToNull(businessId)
+      if (biz && !own('businesses', req.user.id, biz)) throw new Error('Business not found')
+      if (categoryId && !own('categories', req.user.id, categoryId)) throw new Error('Category not found')
+      if (debtId && !own('debts', req.user.id, debtId)) throw new Error('Debt not found')
       const info = db.prepare(`INSERT INTO recurring_transactions (user_id, amount, frequency, start_date, end_date, next_date, account_id, to_account_id, category_id, business_id, debt_id, type, description)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, amt, frequency, startDate, endDate || null, startDate, asId(emptyToNull(accountId)), asId(emptyToNull(toAccountId)), asId(emptyToNull(categoryId)), asId(emptyToNull(businessId)), asId(emptyToNull(debtId)), type, description || '')
-      res.json(own('recurring_transactions', req.user.id, info.lastInsertRowid))
+        .run(req.user.id, amt, frequency, startDate, endDate || null, startDate, asId(emptyToNull(accountId)), asId(emptyToNull(toAccountId)), asId(emptyToNull(categoryId)), asId(biz), asId(emptyToNull(debtId)), type, description || '')
+      const created = own('recurring_transactions', req.user.id, info.lastInsertRowid)
+      rememberIdempotent(req, 'recurring_transactions', created.id)
+      res.json(created)
     } catch (e) { res.status(400).json({ error: e.message }) }
   })
 
@@ -658,11 +755,20 @@ async function start() {
     const events = []
     const debts = db.prepare("SELECT * FROM debts WHERE user_id=? AND due_date IS NOT NULL AND due_date>=? AND due_date<=?").all(req.user.id, from, to)
     for (const d of debts) events.push({ date: d.due_date, kind: 'debt', status: d.status === 'overdue' ? 'overdue' : 'expected', title: `${d.creditor} due`, amount: d.minimum_payment || d.current_balance, id: d.id })
+    const confirmed = db.prepare(`SELECT * FROM transactions WHERE user_id=? AND date>=? AND date<=? AND ${LIVE_TX}`).all(req.user.id, from, to)
+    const confirmedRec = new Set(confirmed.filter(t => t.recurring_id).map(t => `${t.recurring_id}:${t.date}`))
     const rec = db.prepare("SELECT * FROM recurring_transactions WHERE user_id=? AND status='active'").all(req.user.id)
     for (const r of rec) {
-      if (r.next_date >= from && r.next_date <= to) events.push({ date: r.next_date, kind: 'recurring', status: 'expected', title: r.description || r.type, amount: r.amount, id: r.id, type: r.type })
+      let d = r.start_date
+      let guard = 0
+      while (d && d <= to && guard++ < 400) {
+        if (d >= from && (!r.end_date || d <= r.end_date) && !confirmedRec.has(`${r.id}:${d}`)) {
+          events.push({ date: d, kind: 'recurring', status: 'expected', title: r.description || r.type, amount: r.amount, id: r.id, type: r.type, businessId: r.business_id })
+        }
+        d = nextRecurringDate(d, r.frequency)
+        if (r.end_date && d > r.end_date) break
+      }
     }
-    const confirmed = db.prepare('SELECT * FROM transactions WHERE user_id=? AND date>=? AND date<=?').all(req.user.id, from, to)
     for (const t of confirmed) events.push({ date: t.date, kind: 'transaction', status: 'confirmed', title: t.description || t.type, amount: t.amount, id: t.id, type: t.type })
     const goals = db.prepare("SELECT * FROM goals WHERE user_id=? AND target_date IS NOT NULL AND target_date>=? AND target_date<=?").all(req.user.id, from, to)
     for (const g of goals) events.push({ date: g.target_date, kind: 'goal', status: 'expected', title: g.name, amount: g.target_amount, id: g.id })
@@ -676,7 +782,7 @@ async function start() {
     const like = `%${q}%`
     const uid = req.user.id
     res.json({
-      transactions: db.prepare('SELECT * FROM transactions WHERE user_id=? AND (description LIKE ? OR notes LIKE ? OR tags LIKE ?) ORDER BY date DESC LIMIT 20').all(uid, like, like, like),
+      transactions: db.prepare(`SELECT * FROM transactions WHERE user_id=? AND ${LIVE_TX} AND (description LIKE ? OR notes LIKE ? OR tags LIKE ?) ORDER BY date DESC LIMIT 20`).all(uid, like, like, like),
       accounts: db.prepare('SELECT * FROM accounts WHERE user_id=? AND (name LIKE ? OR provider LIKE ?) LIMIT 10').all(uid, like, like),
       businesses: db.prepare('SELECT * FROM businesses WHERE user_id=? AND (name LIKE ? OR description LIKE ?) LIMIT 10').all(uid, like, like),
       debts: db.prepare('SELECT * FROM debts WHERE user_id=? AND (creditor LIKE ? OR notes LIKE ?) LIMIT 10').all(uid, like, like),
@@ -695,6 +801,38 @@ async function start() {
     if (!n) return res.status(404).json({ error: 'Not found' })
     db.prepare('UPDATE notifications SET read=1 WHERE id=? AND user_id=?').run(n.id, req.user.id)
     res.json({ ok: true })
+  })
+
+  api.get('/data/export', (req, res) => {
+    const payload = exportUser(req.user.id)
+    audit(req.user.id, 'export', 'user', req.user.id)
+    res.setHeader('Content-Disposition', `attachment; filename="finance-os-${isoDate()}.json"`)
+    res.json(payload)
+  })
+
+  api.post('/data/restore', (req, res) => {
+    try {
+      restoreUser(req.user.id, req.body)
+      recordSnapshot(req.user.id)
+      res.json({ ok: true })
+    } catch (e) { res.status(400).json({ error: e.message }) }
+  })
+
+  api.get('/data/backups', (_req, res) => {
+    res.json({
+      backups: listBackups(),
+      integrity: integrityOk() ? 'ok' : 'failed'
+    })
+  })
+
+  api.post('/data/backup', (_req, res) => {
+    const dest = backupNow('manual')
+    res.json({ ok: true, file: path.basename(dest) })
+  })
+
+  api.get('/audit', (req, res) => {
+    const rows = db.prepare('SELECT id, action, entity, entity_id, created_at FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 100').all(req.user.id)
+    res.json(rows)
   })
 
   api.get('/files/:kind/:filename', (req, res) => {
@@ -717,7 +855,7 @@ async function start() {
     res.sendFile(full)
   })
 
-  app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'Finance OS' }))
+  app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'Finance OS', integrity: integrityOk() ? 'ok' : 'failed', backups: listBackups().length }))
 
   app.use('/api', api)
 
@@ -739,9 +877,17 @@ async function start() {
     app.use(vite.middlewares)
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Finance OS listening on http://0.0.0.0:${PORT}`)
   })
+
+  function shutdown() {
+    try { backupNow('shutdown') } catch { /* keep going */ }
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(0), 2000)
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
 }
 
 function applyGoalDelta(userId, goalId, type, amount) {

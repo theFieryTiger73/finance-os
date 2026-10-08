@@ -14,6 +14,11 @@ export default function Accounts({ user }) {
 
   async function load() { setRows(await api('/accounts')) }
   useEffect(() => { load() }, [])
+  useEffect(() => {
+    const h = () => load()
+    window.addEventListener('fos-refresh', h)
+    return () => window.removeEventListener('fos-refresh', h)
+  }, [])
 
   async function save(e) {
     e.preventDefault()
@@ -36,17 +41,17 @@ export default function Accounts({ user }) {
       {rows.length ? (
         <div className="grid cards-3">
           {rows.map(a => (
-            <div key={a.id} className="card">
+            <div key={a.id} className={`card ${a._pending ? 'pending-row' : ''}`}>
               <div className="row" style={{ justifyContent: 'space-between' }}>
-                <strong>{a.name}</strong>
-                <span className="pill info">{a.type.replace('_', ' ')}</span>
+                <strong>{a.name}{a._pending ? ' · pending' : ''}</strong>
+                <span className="pill info">{String(a.type || '').replace('_', ' ')}</span>
               </div>
               <div className="kpi"><div className="value">{money(a.balance, a.currency || c)}</div></div>
               <p className="sub">{a.provider || 'No provider'} · {a.status}</p>
               <div className="row">
-                <button className="btn sm secondary" onClick={() => setForm({ ...a, initialBalance: a.initial_balance, businessId: a.business_id })}>Edit</button>
-                <button className="btn sm secondary" onClick={async () => setHistory(await api(`/accounts/${a.id}/transactions`))}>History</button>
-                {a.status !== 'archived' && <button className="btn sm ghost" onClick={async () => { await api(`/accounts/${a.id}/archive`, { method: 'POST' }); load() }}>Archive</button>}
+                {!a._pending && <button className="btn sm secondary" onClick={() => setForm({ ...a, initialBalance: a.initial_balance, businessId: a.business_id })}>Edit</button>}
+                {!a._pending && <button className="btn sm secondary" onClick={async () => setHistory(await api(`/accounts/${a.id}/transactions`))}>History</button>}
+                {!a._pending && a.status !== 'archived' && <button className="btn sm ghost" onClick={async () => { await api(`/accounts/${a.id}/archive`, { method: 'POST' }); load() }}>Archive</button>}
               </div>
             </div>
           ))}

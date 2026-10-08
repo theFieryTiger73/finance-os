@@ -2,14 +2,15 @@ import { DatabaseSync } from 'node:sqlite'
 
 const BASE = process.env.BASE || 'http://127.0.0.1:5173'
 
-async function req(path, { method = 'GET', token, body, form } = {}) {
+async function req(path, { method = 'GET', token, body, form, clientId } = {}) {
   const headers = {}
   if (token) headers.Authorization = `Bearer ${token}`
+  if (clientId) headers['Idempotency-Key'] = clientId
   let payload
   if (form) payload = form
   else if (body) {
     headers['Content-Type'] = 'application/json'
-    payload = JSON.stringify(body)
+    payload = JSON.stringify(clientId ? { ...body, clientId } : body)
   }
   const res = await fetch(`${BASE}/api${path}`, { method, headers, body: payload })
   const data = await res.json().catch(() => ({}))
@@ -87,12 +88,32 @@ await req(`/transactions/${ex.id}`, { method: 'PUT', token: t, form: edit })
 const afterE = await req('/accounts', { token: t })
 if (afterE.find(a => a.name === 'M-Pesa').balance !== 5700) throw new Error('edit recalc failed ' + afterE.find(a => a.name === 'M-Pesa').balance)
 
+const recPersonal = await req('/recurring', { method: 'POST', token: t, body: {
+  type: 'expense', amount: 100, frequency: 'monthly', startDate: today(), accountId: acc1.id, description: 'Internet', businessId: ''
+}})
+if (recPersonal.business_id) throw new Error('personal recurring linked to business')
+const recBiz = await req('/recurring', { method: 'POST', token: t, body: {
+  type: 'expense', amount: 250, frequency: 'monthly', startDate: today(), accountId: acc1.id, description: 'Office rent', businessId: biz.id
+}})
+if (Number(recBiz.business_id) !== Number(biz.id)) throw new Error('business recurring missing business')
+const recList = await req('/recurring?businessId=personal', { token: t })
+if (!recList.some(r => r.id === recPersonal.id) || recList.some(r => r.id === recBiz.id)) throw new Error('personal recurring filter failed')
+await req(`/recurring/${recPersonal.id}/confirm`, { method: 'POST', token: t, body: {} })
+const afterRec = await req('/accounts', { token: t })
+if (afterRec.find(a => a.name === 'M-Pesa').balance !== 5600) throw new Error('confirm recurring did not post expense')
+
 const reports = await req('/reports', { token: t })
-if (reports.stats.expenses !== 300) throw new Error('report expenses ' + reports.stats.expenses)
+if (reports.stats.expenses !== 400) throw new Error('report expenses ' + reports.stats.expenses)
 
 const user2 = await req('/auth/register', { method: 'POST', body: {
   firstName: 'Ana', lastName: 'Other', email: `ana.${Date.now()}@example.com`, password: 'password12', currency: 'MZN'
 }})
+const idemKey = `smoke-${Date.now()}`
+const idemBody = { name: 'Idem Wallet', type: 'cash', initialBalance: 10, currency: 'MZN' }
+const i1 = await req('/accounts', { method: 'POST', token: t, body: idemBody, clientId: idemKey })
+const i2 = await req('/accounts', { method: 'POST', token: t, body: idemBody, clientId: idemKey })
+if (i1.id !== i2.id) throw new Error('idempotency failed')
+
 const leak = await fetch(`${BASE}/api/accounts`, { headers: { Authorization: `Bearer ${user2.token}` } }).then(r => r.json())
 if (leak.some(a => a.name === 'M-Pesa')) throw new Error('user isolation failed')
 if (user2.user.brandName !== "Ana's Finance OS") throw new Error('second user brand')
@@ -103,5 +124,6 @@ console.log('SMOKE OK', {
   bank: afterE.find(a => a.name === 'Bank').balance,
   debt: debts[0].current_balance,
   income: dash.stats.income,
-  expenses: reports.stats.expenses
+  expenses: reports.stats.expenses,
+  recurring: recPersonal.id
 })
