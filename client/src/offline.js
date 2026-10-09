@@ -103,8 +103,9 @@ export function isOnline() {
 
 export function isNetworkError(err) {
   if (!err) return false
+  if (err.network) return true
   const msg = String(err.message || err)
-  return !isOnline() || /failed to fetch|networkerror|load failed|offline|network/i.test(msg)
+  return !isOnline() || /failed to fetch|networkerror|load failed|offline|could not reach the server/i.test(msg)
 }
 
 function emit() {

@@ -16,6 +16,49 @@ export function setToken(t) {
   }
 }
 
+export function messageFromFailedResponse(res, data, text) {
+  if (data && typeof data.error === 'string' && data.error.trim()) return data.error
+  const raw = String(text || '')
+  const ct = (res.headers.get('content-type') || '').toLowerCase()
+  const platformMissing = Boolean(res.headers.get('x-vercel-error')) || /DEPLOYMENT_NOT_FOUND|deployment could not be found/i.test(raw)
+  if (platformMissing) return 'The app server did not respond. Sign-in is unavailable.'
+  if (res.status === 404 && (!ct.includes('json') || /<\s*html/i.test(raw))) return 'The app server did not respond. Sign-in is unavailable.'
+  if (res.status === 503) return 'Sign-in is unavailable. Server configuration is incomplete.'
+  if (res.status >= 500) return 'The server had a problem. Please try again.'
+  if (!ct.includes('json') || /<\s*html/i.test(raw)) return 'The app server did not respond. Sign-in is unavailable.'
+  return 'Request failed'
+}
+
+export async function readApiResponse(res) {
+  const text = await res.text()
+  let data = {}
+  if (text) {
+    try { data = JSON.parse(text) } catch { data = {} }
+  }
+  if (!res.ok) {
+    const err = new Error(messageFromFailedResponse(res, data, text))
+    err.status = res.status
+    throw err
+  }
+  if (text && (data == null || typeof data !== 'object')) {
+    const err = new Error('The app server did not respond. Sign-in is unavailable.')
+    err.status = res.status
+    throw err
+  }
+  return text ? data : {}
+}
+
+function networkFail(cause) {
+  const err = new Error(
+    !isOnline()
+      ? 'You appear to be offline. Check your connection and try again.'
+      : 'Could not reach the server. Check your connection and try again.'
+  )
+  err.network = true
+  err.cause = cause
+  return err
+}
+
 async function rawFetch(path, { method = 'GET', body, form, clientId } = {}) {
   const headers = { Authorization: getToken() ? `Bearer ${getToken()}` : '' }
   if (clientId) headers['Idempotency-Key'] = clientId
@@ -27,14 +70,13 @@ async function rawFetch(path, { method = 'GET', body, form, clientId } = {}) {
     headers['Content-Type'] = 'application/json'
     payload = JSON.stringify(clientId ? { ...body, clientId } : body)
   }
-  const res = await fetch(`/api${path}`, { method, headers, body: payload })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    const err = new Error(data.error || 'Request failed')
-    err.status = res.status
-    throw err
+  let res
+  try {
+    res = await fetch(`/api${path}`, { method, headers, body: payload })
+  } catch (e) {
+    throw networkFail(e)
   }
-  return data
+  return readApiResponse(res)
 }
 
 export async function api(path, { method = 'GET', body, form } = {}) {

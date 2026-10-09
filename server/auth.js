@@ -6,7 +6,8 @@ import path from 'path'
 import { db, seedDefaultCategories, dataDir } from './db.js'
 
 function loadJwtSecret() {
-  if (process.env.JWT_SECRET) return process.env.JWT_SECRET
+  if (process.env.JWT_SECRET && String(process.env.JWT_SECRET).length >= 16) return process.env.JWT_SECRET
+  if (process.env.VERCEL) return null
   const secretFile = path.join(dataDir, '.jwt-secret')
   if (fs.existsSync(secretFile)) return fs.readFileSync(secretFile, 'utf8').trim()
   const secret = crypto.randomBytes(32).toString('hex')
@@ -16,7 +17,12 @@ function loadJwtSecret() {
 
 const JWT_SECRET = loadJwtSecret()
 
+export function jwtConfigured() {
+  return Boolean(JWT_SECRET)
+}
+
 export function signToken(user) {
+  if (!JWT_SECRET) throw new Error('Sign-in is unavailable. Server configuration is incomplete.')
   return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '14d' })
 }
 

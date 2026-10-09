@@ -4,8 +4,9 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const dataDir = path.join(__dirname, '..', 'data')
-const uploadsDir = path.join(__dirname, '..', 'uploads')
+const onVercel = Boolean(process.env.VERCEL)
+const dataDir = process.env.DATA_DIR || (onVercel ? '/tmp/finance-os' : path.join(__dirname, '..', 'data'))
+const uploadsDir = process.env.UPLOADS_DIR || ((onVercel || process.env.DATA_DIR) ? path.join(dataDir, 'uploads') : path.join(__dirname, '..', 'uploads'))
 fs.mkdirSync(dataDir, { recursive: true })
 fs.mkdirSync(path.join(uploadsDir, 'logos'), { recursive: true })
 fs.mkdirSync(path.join(uploadsDir, 'attachments'), { recursive: true })
@@ -15,7 +16,7 @@ const backupsDir = path.join(dataDir, 'backups')
 fs.mkdirSync(backupsDir, { recursive: true })
 
 const db = new DatabaseSync(dbPath)
-db.exec('PRAGMA journal_mode = WAL')
+db.exec(onVercel ? 'PRAGMA journal_mode = DELETE' : 'PRAGMA journal_mode = WAL')
 db.exec('PRAGMA synchronous = FULL')
 db.exec('PRAGMA busy_timeout = 8000')
 db.exec('PRAGMA foreign_keys = ON')

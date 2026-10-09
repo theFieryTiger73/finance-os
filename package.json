@@ -4,6 +4,9 @@
   "private": true,
   "description": "Finance OS — Your money. Your businesses. One system.",
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "node server/index.js",
     "start": "node server/index.js",

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url'
 import bcrypt from 'bcryptjs'
 import { db, uploadsDir, LIVE_TX } from './db.js'
 import { audit, backupNow, maybeAutoBackup, listBackups, exportUser, restoreUser, integrityOk } from './persist.js'
-import { authMiddleware, publicUser, register, login, signToken, createResetToken, resetPassword } from './auth.js'
+import { authMiddleware, publicUser, register, login, signToken, createResetToken, resetPassword, jwtConfigured } from './auth.js'
 import {
   accountBalance, allAccountBalances, syncDebtBalance, syncAllDebts, debtBalance, netWorth, recordSnapshot,
   periodRange, periodStats, cashFlowSeries, expenseDistribution, financialHealthScore,
@@ -104,7 +104,7 @@ function refreshNotifications(userId) {
   }
 }
 
-async function start() {
+export async function createApp() {
     maybeAutoBackup()
     const app = express()
     app.use(express.json({ limit: '8mb' }))
@@ -113,6 +113,7 @@ async function start() {
 
   api.post('/auth/register', (req, res) => {
     try {
+      if (!jwtConfigured()) return res.status(503).json({ error: 'Sign-in is unavailable. Server configuration is incomplete.' })
       const user = register(req.body)
       res.json({ token: signToken(user), user: publicUser(user) })
     } catch (e) { res.status(400).json({ error: e.message }) }
@@ -120,9 +121,13 @@ async function start() {
 
   api.post('/auth/login', (req, res) => {
     try {
+      if (!jwtConfigured()) return res.status(503).json({ error: 'Sign-in is unavailable. Server configuration is incomplete.' })
       const user = login(req.body.email, req.body.password)
       res.json({ token: signToken(user), user: publicUser(user) })
-    } catch (e) { res.status(400).json({ error: e.message }) }
+    } catch (e) {
+      const invalid = e.message === 'Invalid email or password'
+      res.status(invalid ? 401 : 400).json({ error: e.message })
+    }
   })
 
   api.post('/auth/forgot', (req, res) => {
@@ -855,15 +860,24 @@ async function start() {
     res.sendFile(full)
   })
 
-  app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'Finance OS', integrity: integrityOk() ? 'ok' : 'failed', backups: listBackups().length }))
+  app.get('/api/health', (_req, res) => res.json({
+    ok: true,
+    name: 'Finance OS',
+    integrity: integrityOk() ? 'ok' : 'failed',
+    backups: listBackups().length,
+    auth: jwtConfigured() ? 'ok' : 'unconfigured'
+  }))
 
   app.use('/api', api)
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }))
 
   app.use((err, _req, res, _next) => {
     res.status(400).json({ error: err.message || 'Request failed' })
   })
 
-  if (isProd) {
+  if (process.env.VERCEL) {
+    /* static assets and SPA fallback are served by the platform */
+  } else if (isProd) {
     const dist = path.join(__dirname, '..', 'dist')
     app.use(express.static(dist))
     app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')))
@@ -877,6 +891,11 @@ async function start() {
     app.use(vite.middlewares)
   }
 
+  return app
+}
+
+async function start() {
+  const app = await createApp()
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Finance OS listening on http://0.0.0.0:${PORT}`)
   })
@@ -909,7 +928,10 @@ function nextRecurringDate(date, frequency) {
   return d.toISOString().slice(0, 10)
 }
 
-start().catch(err => {
-  console.error(err)
-  process.exit(1)
-})
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (isMain) {
+  start().catch(err => {
+    console.error(err)
+    process.exit(1)
+  })
+}

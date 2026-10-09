@@ -1,7 +1,7 @@
 import {
   queueAll, queueRemove, queueUpdate, cacheClearPrefix, payloadToForm, isOnline, isNetworkError
 } from './offline.js'
-import { getToken } from './api.js'
+import { getToken, readApiResponse } from './api.js'
 
 let flushing = false
 
@@ -16,14 +16,20 @@ async function send(item) {
     headers['Content-Type'] = 'application/json'
     payload = JSON.stringify({ ...item.body, clientId: item.clientId })
   }
-  const res = await fetch(`/api${item.path}`, { method: item.method, headers, body: payload })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    const err = new Error(data.error || 'Request failed')
-    err.status = res.status
+  let res
+  try {
+    res = await fetch(`/api${item.path}`, { method: item.method, headers, body: payload })
+  } catch (e) {
+    const err = new Error(
+      !isOnline()
+        ? 'You appear to be offline. Check your connection and try again.'
+        : 'Could not reach the server. Check your connection and try again.'
+    )
+    err.network = true
+    err.cause = e
     throw err
   }
-  return data
+  return readApiResponse(res)
 }
 
 export async function flushQueue() {
