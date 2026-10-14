@@ -8,17 +8,18 @@ const TABLES = [
   'goals', 'recurring_transactions', 'attachments', 'financial_snapshots',
   'notifications', 'allocation_rules'
 ]
-export function audit(userId, action, entity, entityId, before = null, after = null) {
-  db.prepare('INSERT INTO audit_log (user_id, action, entity, entity_id, before_json, after_json) VALUES (?,?,?,?,?,?)')
+export async function audit(userId, action, entity, entityId, before = null, after = null) {
+  await db.prepare('INSERT INTO audit_log (user_id, action, entity, entity_id, before_json, after_json) VALUES (?,?,?,?,?,?)')
     .run(userId || null, action, entity, entityId || null, before ? JSON.stringify(before) : '', after ? JSON.stringify(after) : '')
 }
 
-export function checkpoint() {
-  try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch { /* ignore */ }
+export async function checkpoint() {
+  try { await db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch { /* ignore */ }
 }
 
-export function backupNow(reason = 'auto') {
-  checkpoint()
+export async function backupNow(reason = 'auto') {
+  if (db.dialect === 'postgres') return null
+  await checkpoint()
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
   const dest = path.join(backupsDir, `finance-${stamp}-${reason}.db`)
   fs.copyFileSync(dbPath, dest)
@@ -29,18 +30,20 @@ export function backupNow(reason = 'auto') {
   return dest
 }
 
-export function maybeAutoBackup() {
+export async function maybeAutoBackup() {
+  if (db.dialect === 'postgres') return null
   const marker = path.join(dataDir, '.last-backup')
   const today = isoDate()
   try {
     if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === today) return null
   } catch { /* backup anyway */ }
-  const dest = backupNow('daily')
+  const dest = await backupNow('daily')
   fs.writeFileSync(marker, today)
   return dest
 }
 
 export function listBackups() {
+  if (db.dialect === 'postgres' || !fs.existsSync(backupsDir)) return []
   return fs.readdirSync(backupsDir)
     .filter(f => f.endsWith('.db'))
     .map(f => {
@@ -50,11 +53,11 @@ export function listBackups() {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 
-export function exportUser(userId) {
-  const user = db.prepare('SELECT id, first_name, last_name, email, country, currency, language, theme, onboarding_completed, onboarding_step, emergency_fund_target, min_liquidity, created_at, updated_at FROM users WHERE id=?').get(userId)
+export async function exportUser(userId) {
+  const user = await db.prepare('SELECT id, first_name, last_name, email, country, currency, language, theme, onboarding_completed, onboarding_step, emergency_fund_target, min_liquidity, created_at, updated_at FROM users WHERE id=?').get(userId)
   const data = {}
   for (const table of TABLES) {
-    data[table] = db.prepare(`SELECT * FROM ${table} WHERE user_id=?`).all(userId)
+    data[table] = await db.prepare(`SELECT * FROM ${table} WHERE user_id=?`).all(userId)
   }
   return {
     version: 1,
@@ -64,36 +67,44 @@ export function exportUser(userId) {
   }
 }
 
-export function restoreUser(userId, payload) {
+export async function restoreUser(userId, payload) {
   if (!payload || payload.version !== 1 || !payload.data) throw new Error('Invalid backup file')
   const src = payload.data
-  db.exec('BEGIN')
+  await db.exec('BEGIN')
   try {
     for (const table of TABLES) {
       const rows = Array.isArray(src[table]) ? src[table] : []
       for (const row of rows) {
-        const mine = db.prepare(`SELECT id FROM ${table} WHERE id=? AND user_id=?`).get(row.id, userId)
+        const mine = await db.prepare(`SELECT id FROM ${table} WHERE id=? AND user_id=?`).get(row.id, userId)
         if (mine) continue
         const cols = Object.keys(row).filter(k => k !== 'user_id')
-        const idFree = row.id != null && !db.prepare(`SELECT id FROM ${table} WHERE id=?`).get(row.id)
+        const idFree = row.id != null && !(await db.prepare(`SELECT id FROM ${table} WHERE id=?`).get(row.id))
         const useCols = idFree ? cols : cols.filter(k => k !== 'id')
         if (!useCols.length) continue
         const placeholders = useCols.map(() => '?').join(',')
-        db.prepare(`INSERT INTO ${table} (user_id, ${useCols.join(',')}) VALUES (?,${placeholders})`)
+        await db.prepare(`INSERT INTO ${table} (user_id, ${useCols.join(',')}) VALUES (?,${placeholders})`)
           .run(userId, ...useCols.map(c => row[c]))
       }
     }
-    db.exec('COMMIT')
+    await db.exec('COMMIT')
   } catch (e) {
-    db.exec('ROLLBACK')
+    await db.exec('ROLLBACK')
     throw e
   }
-  audit(userId, 'restore', 'user', userId, null, { tables: TABLES })
-  backupNow('after-restore')
+  await audit(userId, 'restore', 'user', userId, null, { tables: TABLES })
+  await backupNow('after-restore')
 }
 
-export function integrityOk() {
-  const row = db.prepare('PRAGMA integrity_check').get()
+export async function integrityOk() {
+  if (db.dialect === 'postgres') {
+    try {
+      await db.prepare('SELECT 1 AS ok').get()
+      return true
+    } catch {
+      return false
+    }
+  }
+  const row = await db.prepare('PRAGMA integrity_check').get()
   const value = row?.integrity_check || Object.values(row || {})[0]
   return value === 'ok'
 }

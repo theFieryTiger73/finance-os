@@ -34,12 +34,12 @@ function tokenFromRequest(req) {
   return m ? decodeURIComponent(m[1]) : ''
 }
 
-export function authMiddleware(req, res, next) {
+export async function authMiddleware(req, res, next) {
   const token = tokenFromRequest(req)
   if (!token) return res.status(401).json({ error: 'Authentication required' })
   try {
     const payload = jwt.verify(token, JWT_SECRET)
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.id)
+    const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(payload.id)
     if (!user) return res.status(401).json({ error: 'Invalid session' })
     req.user = user
     next()
@@ -73,41 +73,41 @@ export function possessiveBrand(firstName) {
   return `${name}${suffix} Finance OS`
 }
 
-export function register({ firstName, lastName, email, password, country, currency }) {
+export async function register({ firstName, lastName, email, password, country, currency }) {
   if (!firstName || !lastName || !email || !password) throw new Error('First name, last name, email and password are required')
   if (password.length < 8) throw new Error('Password must be at least 8 characters')
-  const existing = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(email)
+  const existing = await db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(email)
   if (existing) throw new Error('An account with this email already exists')
   const hash = bcrypt.hashSync(password, 10)
-  const info = db.prepare(`
+  const info = await db.prepare(`
     INSERT INTO users (first_name, last_name, email, password_hash, country, currency)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(firstName.trim(), lastName.trim(), email.trim().toLowerCase(), hash, country || 'MZ', currency || 'MZN')
-  seedDefaultCategories(info.lastInsertRowid)
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid)
+  await seedDefaultCategories(info.lastInsertRowid)
+  return await db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid)
 }
 
-export function login(email, password) {
-  const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email || '')
+export async function login(email, password) {
+  const user = await db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email || '')
   if (!user || !bcrypt.compareSync(password || '', user.password_hash)) throw new Error('Invalid email or password')
   return user
 }
 
-export function createResetToken(email) {
-  const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email || '')
+export async function createResetToken(email) {
+  const user = await db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email || '')
   if (!user) return null
   const token = crypto.randomBytes(24).toString('hex')
   const expires = new Date(Date.now() + 1000 * 60 * 60).toISOString()
-  db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)').run(user.id, token, expires)
+  await db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)').run(user.id, token, expires)
   return { token, email: user.email }
 }
 
-export function resetPassword(token, password) {
+export async function resetPassword(token, password) {
   if (!password || password.length < 8) throw new Error('Password must be at least 8 characters')
-  const row = db.prepare("SELECT * FROM password_resets WHERE token = ? AND used = 0 AND expires_at > datetime('now')").get(token)
+  const row = await db.prepare("SELECT * FROM password_resets WHERE token = ? AND used = 0 AND expires_at > datetime('now')").get(token)
   if (!row) throw new Error('Invalid or expired reset token')
   const hash = bcrypt.hashSync(password, 10)
-  db.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").run(hash, row.user_id)
-  db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(row.id)
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(row.user_id)
+  await db.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").run(hash, row.user_id)
+  await db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(row.id)
+  return await db.prepare('SELECT * FROM users WHERE id = ?').get(row.user_id)
 }

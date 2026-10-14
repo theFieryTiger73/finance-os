@@ -37,10 +37,10 @@ export function periodRange(period, customFrom, customTo) {
   return { from: `${y}-${String(m).padStart(2, '0')}-01`, to: s }
 }
 
-export function accountBalance(userId, accountId) {
-  const acc = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(accountId, userId)
+export async function accountBalance(userId, accountId) {
+  const acc = await db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').get(accountId, userId)
   if (!acc) return 0
-  const txs = db.prepare(`SELECT * FROM transactions WHERE user_id = ? AND (account_id = ? OR to_account_id = ?) AND ${LIVE_TX}`).all(userId, accountId, accountId)
+  const txs = await db.prepare(`SELECT * FROM transactions WHERE user_id = ? AND (account_id = ? OR to_account_id = ?) AND ${LIVE_TX}`).all(userId, accountId, accountId)
   let cents = toCents(acc.initial_balance)
   for (const t of txs) cents += effectOnAccountCents(t, accountId)
   return fromCents(cents)
@@ -71,51 +71,53 @@ function effectOnAccountCents(t, accountId) {
   }
 }
 
-export function allAccountBalances(userId, { includeArchived = false } = {}) {
+export async function allAccountBalances(userId, { includeArchived = false } = {}) {
   const sql = includeArchived
     ? 'SELECT * FROM accounts WHERE user_id = ?'
     : "SELECT * FROM accounts WHERE user_id = ? AND status != 'archived'"
-  const accounts = db.prepare(sql).all(userId)
-  return accounts.map(a => ({ ...a, balance: accountBalance(userId, a.id) }))
+  const accounts = await db.prepare(sql).all(userId)
+  const out = []
+  for (const a of accounts) out.push({ ...a, balance: await accountBalance(userId, a.id) })
+  return out
 }
 
-export function debtBalance(userId, debtId) {
-  const d = db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
+export async function debtBalance(userId, debtId) {
+  const d = await db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
   if (!d) return 0
   const opening = d.opening_balance != null ? d.opening_balance : d.original_amount
-  const paid = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(userId, debtId).s
+  const paid = (await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(userId, debtId)).s
   return fromCents(Math.max(0, toCents(opening) - toCents(paid)))
 }
 
-export function syncDebtBalance(userId, debtId) {
-  const d = db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
+export async function syncDebtBalance(userId, debtId) {
+  const d = await db.prepare('SELECT * FROM debts WHERE id = ? AND user_id = ?').get(debtId, userId)
   if (!d) return 0
-  const remaining = debtBalance(userId, debtId)
+  const remaining = await debtBalance(userId, debtId)
   let status = d.status
   if (d.status !== 'archived') {
     if (remaining <= 0) status = 'paid'
     else if (d.due_date && d.due_date < isoDate() && remaining > 0) status = 'overdue'
     else if (status === 'paid' || status === 'overdue') status = 'active'
   }
-  db.prepare("UPDATE debts SET current_balance = ?, status = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
+  await db.prepare("UPDATE debts SET current_balance = ?, status = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
     .run(remaining, status, debtId, userId)
   return remaining
 }
 
-export function goalProgress(userId, goalId) {
-  const g = db.prepare('SELECT * FROM goals WHERE id = ? AND user_id = ?').get(goalId, userId)
+export async function goalProgress(userId, goalId) {
+  const g = await db.prepare('SELECT * FROM goals WHERE id = ? AND user_id = ?').get(goalId, userId)
   if (!g) return 0
   if (g.account_id) return accountBalance(userId, g.account_id)
   return fromCents(toCents(g.current_amount))
 }
 
-export function syncAllDebts(userId) {
-  const rows = db.prepare("SELECT id FROM debts WHERE user_id = ? AND status != 'archived'").all(userId)
-  for (const d of rows) syncDebtBalance(userId, d.id)
+export async function syncAllDebts(userId) {
+  const rows = await db.prepare("SELECT id FROM debts WHERE user_id = ? AND status != 'archived'").all(userId)
+  for (const d of rows) await syncDebtBalance(userId, d.id)
 }
 
-export function netWorth(userId) {
-  const accounts = allAccountBalances(userId, { includeArchived: true })
+export async function netWorth(userId) {
+  const accounts = await allAccountBalances(userId, { includeArchived: true })
   let assetCents = 0
   let liabilityCents = 0
   let cashCents = 0
@@ -128,10 +130,10 @@ export function netWorth(userId) {
       if (CASH_TYPES.has(a.type) && a.status !== 'archived') cashCents += c
     }
   }
-  const debts = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
+  const debts = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
   let debtCents = 0
   for (const d of debts) {
-    const bal = toCents(debtBalance(userId, d.id))
+    const bal = toCents(await debtBalance(userId, d.id))
     debtCents += bal
     liabilityCents += bal
   }
@@ -144,10 +146,10 @@ export function netWorth(userId) {
   }
 }
 
-export function recordSnapshot(userId) {
-  const nw = netWorth(userId)
+export async function recordSnapshot(userId) {
+  const nw = await netWorth(userId)
   const date = isoDate()
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO financial_snapshots (user_id, date, net_worth, assets, liabilities, cash, debt)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id, date) DO UPDATE SET
@@ -160,7 +162,7 @@ export function recordSnapshot(userId) {
   return nw
 }
 
-function txFilter(userId, { from, to, scope, businessId }) {
+async function txFilter(userId, { from, to, scope, businessId }) {
   let sql = `SELECT * FROM transactions WHERE user_id = ? AND ${LIVE_TX}`
   const params = [userId]
   if (from) { sql += ' AND date >= ?'; params.push(from) }
@@ -169,11 +171,11 @@ function txFilter(userId, { from, to, scope, businessId }) {
   else if (scope === 'business' && !businessId) sql += ' AND business_id IS NOT NULL'
   if (businessId) { sql += ' AND business_id = ?'; params.push(Number(businessId)) }
   sql += ' ORDER BY date DESC, id DESC'
-  return db.prepare(sql).all(...params)
+  return await db.prepare(sql).all(...params)
 }
 
-export function periodStats(userId, opts = {}) {
-  const txs = txFilter(userId, opts)
+export async function periodStats(userId, opts = {}) {
+  const txs = await txFilter(userId, opts)
   let income = 0, expenses = 0, businessRevenue = 0, businessExpenses = 0, ownerDraws = 0, ownerContrib = 0, debtPayments = 0
   for (const t of txs) {
     const amt = toCents(t.amount)
@@ -207,8 +209,8 @@ export function periodStats(userId, opts = {}) {
   }
 }
 
-export function cashFlowSeries(userId, opts = {}) {
-  const txs = txFilter(userId, opts).slice().reverse()
+export async function cashFlowSeries(userId, opts = {}) {
+  const txs = (await txFilter(userId, opts)).slice().reverse()
   const map = {}
   for (const t of txs) {
     const d = t.date.slice(0, 10)
@@ -226,9 +228,9 @@ export function cashFlowSeries(userId, opts = {}) {
   }))
 }
 
-export function expenseDistribution(userId, opts = {}) {
-  const txs = txFilter(userId, opts).filter(t => t.type === 'expense' || t.type === 'refund')
-  const cats = db.prepare('SELECT * FROM categories WHERE user_id = ?').all(userId)
+export async function expenseDistribution(userId, opts = {}) {
+  const txs = (await txFilter(userId, opts)).filter(t => t.type === 'expense' || t.type === 'refund')
+  const cats = await db.prepare('SELECT * FROM categories WHERE user_id = ?').all(userId)
   const cmap = Object.fromEntries(cats.map(c => [c.id, c]))
   const map = {}
   for (const t of txs) {
@@ -243,14 +245,14 @@ export function expenseDistribution(userId, opts = {}) {
   return Object.values(map).filter(x => x.amount > 0).map(x => ({ ...x, amount: fromCents(x.amount) })).sort((a, b) => b.amount - a.amount)
 }
 
-export function financialHealthScore(userId) {
-  const nw = netWorth(userId)
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
+export async function financialHealthScore(userId) {
+  const nw = await netWorth(userId)
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   const month = periodRange('month')
-  const stats = periodStats(userId, month)
-  const debts = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
-  const goals = db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
-  const budgets = budgetPerformance(userId, month)
+  const stats = await periodStats(userId, month)
+  const debts = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
+  const goals = await db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
+  const budgets = await budgetPerformance(userId, month)
 
   const breakdown = []
   let score = 0
@@ -330,7 +332,8 @@ export function financialHealthScore(userId) {
 
   // Income consistency 5
   const months = lastNMonths(3)
-  const incomes = months.map(p => periodStats(userId, p).income)
+  const incomes = []
+  for (const p of months) incomes.push((await periodStats(userId, p)).income)
   let cons = 3
   if (incomes.every(i => i > 0)) {
     const avg = incomes.reduce((a, b) => a + b, 0) / incomes.length
@@ -342,7 +345,7 @@ export function financialHealthScore(userId) {
   breakdown.push({ key: 'income_consistency', label: 'Income consistency', points: cons, max: 5 })
 
   // Net worth trend 10
-  const snaps = db.prepare('SELECT * FROM financial_snapshots WHERE user_id = ? ORDER BY date ASC').all(userId)
+  const snaps = await db.prepare('SELECT * FROM financial_snapshots WHERE user_id = ? ORDER BY date ASC').all(userId)
   let trend = 5
   if (snaps.length >= 2) {
     const first = snaps[0].net_worth
@@ -375,9 +378,10 @@ function lastNMonths(n) {
   return out
 }
 
-export function budgetPerformance(userId, range) {
-  const budgets = db.prepare("SELECT * FROM budgets WHERE user_id = ? AND status = 'active'").all(userId)
-  return budgets.map(b => {
+export async function budgetPerformance(userId, range) {
+  const budgets = await db.prepare("SELECT * FROM budgets WHERE user_id = ? AND status = 'active'").all(userId)
+  const out = []
+  for (const b of budgets) {
     let spent = 0
     let sql = `SELECT * FROM transactions WHERE user_id = ? AND type IN ('expense','refund') AND ${LIVE_TX}`
     const params = [userId]
@@ -387,7 +391,7 @@ export function budgetPerformance(userId, range) {
     if (b.scope === 'personal') sql += ' AND business_id IS NULL'
     if (b.scope === 'business' && b.business_id) { sql += ' AND business_id = ?'; params.push(b.business_id) }
     else if (b.scope === 'business') sql += ' AND business_id IS NOT NULL'
-    const txs = db.prepare(sql).all(...params)
+    const txs = await db.prepare(sql).all(...params)
     for (const t of txs) {
       const amt = toCents(t.amount)
       spent += t.type === 'refund' ? -amt : amt
@@ -398,26 +402,27 @@ export function budgetPerformance(userId, range) {
     let status = 'ok'
     if (pct >= 100) status = 'exceeded'
     else if (pct >= 80) status = 'warning'
-    return { ...b, spent: fromCents(spent), remaining, percent: round2(pct), status }
-  })
+    out.push({ ...b, spent: fromCents(spent), remaining, percent: round2(pct), status })
+  }
+  return out
 }
 
-export function nextAction(userId) {
-  const nw = netWorth(userId)
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
+export async function nextAction(userId) {
+  const nw = await netWorth(userId)
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   const month = periodRange('month')
-  const stats = periodStats(userId, month)
-  const debts = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue') ORDER BY interest DESC").all(userId)
-  const overdue = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status = 'overdue'").all(userId)
-  const accounts = allAccountBalances(userId)
-  const goals = db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
+  const stats = await periodStats(userId, month)
+  const debts = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue') ORDER BY interest DESC").all(userId)
+  const overdue = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status = 'overdue'").all(userId)
+  const accounts = await allAccountBalances(userId)
+  const goals = await db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
   const minLiq = Number(user.min_liquidity) || 0
   const emergencyTarget = Number(user.emergency_fund_target) || 0
 
   if (accounts.length === 0) {
     return { severity: 'info', title: 'Add your first account', body: 'No accounts yet. Add your first account to start tracking cash, banks and wallets.' }
   }
-  const txCount = db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId).c
+  const txCount = (await db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId)).c
   if (txCount === 0) {
     return { severity: 'info', title: 'Record a transaction', body: 'Accounts are ready. Add income or an expense so Finance OS can calculate cash flow.' }
   }
@@ -446,7 +451,7 @@ export function nextAction(userId) {
   }
   if (goals.length) {
     const g = goals[0]
-    const cur = goalProgress(userId, g.id)
+    const cur = await goalProgress(userId, g.id)
     const left = Math.max(0, g.target_amount - cur)
     return { severity: 'info', title: `Fund ${g.name}`, body: `${fmt(left, user.currency)} remaining to reach ${g.name}. Surplus cash flow this period is ${fmt(stats.netCashFlow, user.currency)}.` }
   }
@@ -456,18 +461,18 @@ export function nextAction(userId) {
   return { severity: 'ok', title: 'Keep recording activity', body: 'Continue logging transactions so Finance OS can refine the next action from real data.' }
 }
 
-export function coachInsights(userId) {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
+export async function coachInsights(userId) {
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   const cur = user.currency
   const insights = []
   const thisMonth = periodRange('month')
   const prev = previousMonth()
-  const nowStats = periodStats(userId, thisMonth)
-  const prevStats = periodStats(userId, prev)
-  const nw = netWorth(userId)
+  const nowStats = await periodStats(userId, thisMonth)
+  const prevStats = await periodStats(userId, prev)
+  const nw = await netWorth(userId)
 
-  const cats = expenseDistribution(userId, thisMonth)
-  const prevCats = expenseDistribution(userId, prev)
+  const cats = await expenseDistribution(userId, thisMonth)
+  const prevCats = await expenseDistribution(userId, prev)
   for (const c of cats) {
     const old = prevCats.find(p => p.categoryId === c.categoryId)
     if (old && old.amount > 0) {
@@ -482,7 +487,7 @@ export function coachInsights(userId) {
   }
 
   const debtsNow = nw.debt
-  const prevSnap = db.prepare('SELECT * FROM financial_snapshots WHERE user_id = ? AND date < ? ORDER BY date DESC LIMIT 1')
+  const prevSnap = await db.prepare('SELECT * FROM financial_snapshots WHERE user_id = ? AND date < ? ORDER BY date DESC LIMIT 1')
     .get(userId, thisMonth.from)
   if (prevSnap) {
     const ddelta = debtsNow - prevSnap.debt
@@ -523,16 +528,16 @@ export function coachInsights(userId) {
     }
   }
 
-  const overdue = db.prepare("SELECT COUNT(*) AS c FROM debts WHERE user_id = ? AND status = 'overdue'").get(userId).c
+  const overdue = (await db.prepare("SELECT COUNT(*) AS c FROM debts WHERE user_id = ? AND status = 'overdue'").get(userId)).c
   if (overdue) insights.push({ type: 'critical', text: `${overdue} debt${overdue > 1 ? 's are' : ' is'} overdue.` })
 
-  const upcoming = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status = 'active' AND due_date IS NOT NULL AND due_date <= date('now','+7 day')").all(userId)
+  const upcoming = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status = 'active' AND due_date IS NOT NULL AND due_date <= date('now','+7 day')").all(userId)
   for (const d of upcoming) {
     insights.push({ type: 'warning', text: `${d.creditor} payment is due ${d.due_date} (${fmt(d.minimum_payment || d.current_balance, cur)}).` })
   }
 
   if (!insights.length) {
-    const txCount = db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId).c
+    const txCount = (await db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND ${LIVE_TX}`).get(userId)).c
     if (!txCount) insights.push({ type: 'info', text: 'No transactions yet. Insights appear after you record real activity.' })
     else insights.push({ type: 'info', text: 'Not enough period-over-period change to flag. Keep recording transactions.' })
   }
@@ -547,16 +552,16 @@ function previousMonth() {
   return { from: `${yy}-${String(mm).padStart(2, '0')}-01`, to: monthEnd(yy, mm) }
 }
 
-export function affordability(userId, amount) {
+export async function affordability(userId, amount) {
   const amt = Number(amount) || 0
-  const nw = netWorth(userId)
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
+  const nw = await netWorth(userId)
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   const month = periodRange('month')
-  const stats = periodStats(userId, month)
-  const budgets = budgetPerformance(userId, month)
-  const debts = db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
+  const stats = await periodStats(userId, month)
+  const budgets = await budgetPerformance(userId, month)
+  const debts = await db.prepare("SELECT * FROM debts WHERE user_id = ? AND status IN ('active','overdue')").all(userId)
   const upcoming = debts.reduce((s, d) => s + (Number(d.minimum_payment) || 0), 0)
-  const goals = db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
+  const goals = await db.prepare("SELECT * FROM goals WHERE user_id = ? AND status = 'active'").all(userId)
   const minLiq = Number(user.min_liquidity) || 0
   const emergencyTarget = Number(user.emergency_fund_target) || 0
   const reasons = []
@@ -588,7 +593,7 @@ export function affordability(userId, amount) {
   }
   if (goals.length && status === 'affordable') {
     const g = goals[0]
-    const left = Math.max(0, g.target_amount - goalProgress(userId, g.id))
+    const left = Math.max(0, g.target_amount - await goalProgress(userId, g.id))
     if (amt > 0 && left > 0 && amt >= left * 0.2) {
       status = 'caution'
       reasons.push(`Spending ${fmt(amt, user.currency)} slows progress toward ${g.name} (${fmt(left, user.currency)} remaining).`)
@@ -605,8 +610,8 @@ export function affordability(userId, amount) {
   return { status, label: labels[status], reasons, cash: nw.cash, cashAfter, upcomingPayments: upcoming }
 }
 
-export function applyAllocation(userId, amount, ruleId) {
-  const rule = db.prepare('SELECT * FROM allocation_rules WHERE id = ? AND user_id = ?').get(ruleId, userId)
+export async function applyAllocation(userId, amount, ruleId) {
+  const rule = await db.prepare('SELECT * FROM allocation_rules WHERE id = ? AND user_id = ?').get(ruleId, userId)
   if (!rule) throw new Error('Rule not found')
   const splits = JSON.parse(rule.splits || '[]')
   const totalPct = splits.reduce((s, x) => s + Number(x.percent || 0), 0)
@@ -620,13 +625,13 @@ export function applyAllocation(userId, amount, ruleId) {
   }))
 }
 
-export function businessSummary(userId, businessId, opts = {}) {
-  const b = db.prepare('SELECT * FROM businesses WHERE id = ? AND user_id = ?').get(businessId, userId)
+export async function businessSummary(userId, businessId, opts = {}) {
+  const b = await db.prepare('SELECT * FROM businesses WHERE id = ? AND user_id = ?').get(businessId, userId)
   if (!b) return null
-  const stats = periodStats(userId, { ...opts, businessId })
-  const accounts = allAccountBalances(userId).filter(a => sameId(a.business_id, businessId))
+  const stats = await periodStats(userId, { ...opts, businessId })
+  const accounts = (await allAccountBalances(userId)).filter(a => sameId(a.business_id, businessId))
   const linkedCash = fromCents(accounts.reduce((s, a) => s + toCents(a.balance), 0))
-  const allBizTx = txFilter(userId, { businessId })
+  const allBizTx = await txFilter(userId, { businessId })
   let opCents = 0
   for (const t of allBizTx) {
     const amt = toCents(t.amount)
@@ -634,7 +639,7 @@ export function businessSummary(userId, businessId, opts = {}) {
     if (t.type === 'expense' || t.type === 'owner_draw') opCents -= amt
   }
   const cash = accounts.length ? linkedCash : fromCents(opCents)
-  const txs = txFilter(userId, { ...opts, businessId })
+  const txs = await txFilter(userId, { ...opts, businessId })
   return { ...b, ...stats, cash, linkedCash, operatingCash: fromCents(opCents), accounts, transactions: txs.slice(0, 20) }
 }
 

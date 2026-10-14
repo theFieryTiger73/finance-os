@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { createPgDatabase, databaseUrlFromEnv } from './pg.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const onVercel = Boolean(process.env.VERCEL)
@@ -15,15 +16,28 @@ const dbPath = path.join(dataDir, 'finance.db')
 const backupsDir = path.join(dataDir, 'backups')
 fs.mkdirSync(backupsDir, { recursive: true })
 
-const db = new DatabaseSync(dbPath)
-db.exec(onVercel ? 'PRAGMA journal_mode = DELETE' : 'PRAGMA journal_mode = WAL')
-db.exec('PRAGMA synchronous = FULL')
-db.exec('PRAGMA busy_timeout = 8000')
-db.exec('PRAGMA foreign_keys = ON')
-db.exec('PRAGMA wal_autocheckpoint = 500')
-db.exec('PRAGMA temp_store = MEMORY')
+export const LIVE_TX = "COALESCE(voided_at,'') = ''"
 
-db.exec(`
+function databaseUrl() {
+  return databaseUrlFromEnv()
+}
+
+function wrapSqlite(raw) {
+  return {
+    dialect: 'sqlite',
+    prepare(sql) {
+      const stmt = raw.prepare(sql)
+      return {
+        get: async (...p) => stmt.get(...p),
+        all: async (...p) => stmt.all(...p),
+        run: async (...p) => stmt.run(...p)
+      }
+    },
+    async exec(sql) { raw.exec(sql) }
+  }
+}
+
+const SQLITE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   first_name TEXT NOT NULL,
@@ -264,10 +278,66 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, created_at);
-`)
+`
 
-export function seedDefaultCategories(userId) {
-  const count = db.prepare('SELECT COUNT(*) AS c FROM categories WHERE user_id = ?').get(userId).c
+function addColumn(raw, sql) {
+  try { raw.exec(sql) } catch { /* already exists */ }
+}
+
+async function createSqliteDatabase() {
+  const raw = new DatabaseSync(dbPath)
+  raw.exec(onVercel ? 'PRAGMA journal_mode = DELETE' : 'PRAGMA journal_mode = WAL')
+  raw.exec('PRAGMA synchronous = FULL')
+  raw.exec('PRAGMA busy_timeout = 8000')
+  raw.exec('PRAGMA foreign_keys = ON')
+  raw.exec('PRAGMA wal_autocheckpoint = 500')
+  raw.exec('PRAGMA temp_store = MEMORY')
+  raw.exec(SQLITE_SCHEMA)
+  addColumn(raw, 'ALTER TABLE debts ADD COLUMN opening_balance REAL')
+  addColumn(raw, 'ALTER TABLE transactions ADD COLUMN voided_at TEXT')
+  addColumn(raw, "ALTER TABLE transactions ADD COLUMN void_reason TEXT DEFAULT ''")
+  addColumn(raw, 'ALTER TABLE transactions ADD COLUMN client_id TEXT')
+  addColumn(raw, 'ALTER TABLE accounts ADD COLUMN client_id TEXT')
+  addColumn(raw, 'ALTER TABLE businesses ADD COLUMN client_id TEXT')
+  addColumn(raw, 'ALTER TABLE debts ADD COLUMN client_id TEXT')
+  addColumn(raw, 'ALTER TABLE goals ADD COLUMN client_id TEXT')
+  addColumn(raw, 'ALTER TABLE budgets ADD COLUMN client_id TEXT')
+  raw.exec(`
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  user_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  entity TEXT,
+  entity_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_client ON transactions(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_client ON accounts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_biz_client ON businesses(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_debt_client ON debts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_client ON goals(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budget_client ON budgets(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
+`)
+  return wrapSqlite(raw)
+}
+
+async function migrateOpeningBalances(database) {
+  const debtsNeedOpening = await database.prepare('SELECT id, original_amount, current_balance FROM debts WHERE opening_balance IS NULL').all()
+  const setOpening = database.prepare('UPDATE debts SET opening_balance = ? WHERE id = ?')
+  for (const d of debtsNeedOpening) {
+    const paidRow = await database.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(d.id)
+    await setOpening.run(Number(d.current_balance) + Number(paidRow?.s || 0), d.id)
+  }
+}
+
+const url = databaseUrl()
+export const db = url ? await createPgDatabase(url) : await createSqliteDatabase()
+await migrateOpeningBalances(db)
+
+export async function seedDefaultCategories(userId) {
+  const count = (await db.prepare('SELECT COUNT(*) AS c FROM categories WHERE user_id = ?').get(userId)).c
   if (count > 0) return
   const insert = db.prepare(`
     INSERT INTO categories (user_id, name, icon, color, type, scope)
@@ -293,54 +363,14 @@ export function seedDefaultCategories(userId) {
     ['Supplies', 'package', '#2E90FA', 'expense', 'business'],
     ['Payroll', 'users', '#7A5AF8', 'expense', 'business']
   ]
-  db.exec('BEGIN')
+  await db.exec('BEGIN')
   try {
-    for (const r of rows) insert.run(userId, ...r)
-    db.exec('COMMIT')
+    for (const r of rows) await insert.run(userId, ...r)
+    await db.exec('COMMIT')
   } catch (e) {
-    db.exec('ROLLBACK')
+    await db.exec('ROLLBACK')
     throw e
   }
 }
 
-function addColumn(sql) {
-  try { db.exec(sql) } catch { /* already exists */ }
-}
-addColumn('ALTER TABLE debts ADD COLUMN opening_balance REAL')
-addColumn('ALTER TABLE transactions ADD COLUMN voided_at TEXT')
-addColumn("ALTER TABLE transactions ADD COLUMN void_reason TEXT DEFAULT ''")
-addColumn('ALTER TABLE transactions ADD COLUMN client_id TEXT')
-addColumn('ALTER TABLE accounts ADD COLUMN client_id TEXT')
-addColumn('ALTER TABLE businesses ADD COLUMN client_id TEXT')
-addColumn('ALTER TABLE debts ADD COLUMN client_id TEXT')
-addColumn('ALTER TABLE goals ADD COLUMN client_id TEXT')
-addColumn('ALTER TABLE budgets ADD COLUMN client_id TEXT')
-db.exec(`
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-  user_id INTEGER NOT NULL,
-  key TEXT NOT NULL,
-  method TEXT NOT NULL,
-  path TEXT NOT NULL,
-  entity TEXT,
-  entity_id INTEGER,
-  created_at TEXT DEFAULT (datetime('now')),
-  PRIMARY KEY (user_id, key)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_client ON transactions(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_client ON accounts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_biz_client ON businesses(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_debt_client ON debts(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_client ON goals(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_budget_client ON budgets(user_id, client_id) WHERE client_id IS NOT NULL AND client_id != '';
-`)
-
-export const LIVE_TX = "COALESCE(voided_at,'') = ''"
-
-const debtsNeedOpening = db.prepare('SELECT id, original_amount, current_balance FROM debts WHERE opening_balance IS NULL').all()
-const setOpening = db.prepare('UPDATE debts SET opening_balance = ? WHERE id = ?')
-for (const d of debtsNeedOpening) {
-  const paid = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE debt_id = ? AND type = 'debt_payment' AND ${LIVE_TX}`).get(d.id).s
-  setOpening.run(Number(d.current_balance) + Number(paid || 0), d.id)
-}
-
-export { db, dataDir, uploadsDir, backupsDir, dbPath }
+export { dataDir, uploadsDir, backupsDir, dbPath }

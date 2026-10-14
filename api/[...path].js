@@ -1,3 +1,1 @@
-import handler from './index.js'
-
-export default handler
+export { default } from './index.js'

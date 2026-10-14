@@ -10,18 +10,21 @@
   "scripts": {
     "dev": "node server/index.js",
     "start": "node server/index.js",
-    "build": "vite build --config client/vite.config.js"
+    "build": "vite build --config client/vite.config.js",
+    "db:check": "node scripts/check-db.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.3",
     "bcryptjs": "^2.4.3",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.468.0",
     "multer": "^1.4.5-lts.2",
+    "pg": "^8.16.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.0",
-    "recharts": "^2.15.0",
-    "lucide-react": "^0.468.0"
+    "recharts": "^2.15.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
