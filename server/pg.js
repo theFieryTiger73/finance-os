@@ -5,9 +5,27 @@ import { PG_SCHEMA } from './schema.pg.js'
 const { Pool } = pg
 const txStore = new AsyncLocalStorage()
 
+const DATABASE_URL_KEYS = ['USER_DATABASE_URL', 'DATABASE_URL', 'SUPABASE_DB_URL', 'POSTGRES_URL']
+
+export function databaseUrlSource() {
+  for (const name of DATABASE_URL_KEYS) {
+    const raw = String(process.env[name] || '').trim()
+    if (raw) return name
+  }
+  return ''
+}
+
 export function databaseUrlFromEnv() {
-  const raw = process.env.USER_DATABASE_URL || process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || process.env.POSTGRES_URL || ''
-  return String(raw).trim()
+  const name = databaseUrlSource()
+  return name ? String(process.env[name] || '').trim() : ''
+}
+
+export function databaseHostFromUrl(url) {
+  try {
+    return new URL(String(url)).host || ''
+  } catch {
+    return ''
+  }
 }
 
 export function sqliteToPg(sql) {

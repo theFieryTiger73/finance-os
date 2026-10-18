@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { createPgDatabase, databaseUrlFromEnv } from './pg.js'
+import { createPgDatabase, databaseUrlFromEnv, databaseUrlSource, databaseHostFromUrl } from './pg.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const onVercel = Boolean(process.env.VERCEL)
@@ -356,7 +356,17 @@ if (!url && onVercel) {
   e.code = 'DB_URL_MISSING'
   throw e
 }
-export const db = url ? await createPgDatabase(url) : await createSqliteDatabase()
+async function createPostgresDatabase(connectionString) {
+  try {
+    return await createPgDatabase(connectionString)
+  } catch (err) {
+    err.dbSource = databaseUrlSource()
+    err.dbHost = databaseHostFromUrl(connectionString)
+    throw err
+  }
+}
+
+export const db = url ? await createPostgresDatabase(url) : await createSqliteDatabase()
 await migrateOpeningBalances(db)
 
 export async function seedDefaultCategories(userId) {

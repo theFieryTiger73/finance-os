@@ -51,7 +51,9 @@ export default async function handler(req, res) {
     res.end(JSON.stringify({
       error: 'Server initialization failed',
       code,
-      hint: HINTS[code] || HINTS.DATABASE_INIT_FAILED
+      hint: HINTS[code] || HINTS.DATABASE_INIT_FAILED,
+      ...(err && err.dbSource ? { source: err.dbSource } : {}),
+      ...(err && err.dbHost ? { host: err.dbHost } : {})
     }))
   }
 }
