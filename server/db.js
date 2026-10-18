@@ -1,4 +1,3 @@
-import { DatabaseSync } from 'node:sqlite'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -284,7 +283,22 @@ function addColumn(raw, sql) {
   try { raw.exec(sql) } catch { /* already exists */ }
 }
 
+async function loadDatabaseSync() {
+  try {
+    return (await import('node:sqlite')).DatabaseSync
+  } catch (err) {
+    const e = new Error(
+      'SQLite backend is unavailable in this runtime: the node:sqlite built-in module is disabled. ' +
+      'Configure a PostgreSQL connection URL (DATABASE_URL or SUPABASE_DB_URL) for this deployment. ' +
+      `Underlying error: ${err && err.message ? err.message : String(err)}`
+    )
+    e.code = 'SQLITE_UNAVAILABLE'
+    throw e
+  }
+}
+
 async function createSqliteDatabase() {
+  const DatabaseSync = await loadDatabaseSync()
   const raw = new DatabaseSync(dbPath)
   raw.exec(onVercel ? 'PRAGMA journal_mode = DELETE' : 'PRAGMA journal_mode = WAL')
   raw.exec('PRAGMA synchronous = FULL')
@@ -333,6 +347,15 @@ async function migrateOpeningBalances(database) {
 }
 
 const url = databaseUrl()
+if (!url && onVercel) {
+  const e = new Error(
+    'No database URL configured for this serverless deployment. Set DATABASE_URL ' +
+    '(or SUPABASE_DB_URL) to the production PostgreSQL connection string. ' +
+    'Refusing to fall back to ephemeral SQLite on Vercel.'
+  )
+  e.code = 'DB_URL_MISSING'
+  throw e
+}
 export const db = url ? await createPgDatabase(url) : await createSqliteDatabase()
 await migrateOpeningBalances(db)
 
